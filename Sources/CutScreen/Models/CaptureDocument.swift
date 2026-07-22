@@ -7,6 +7,7 @@ final class CaptureDocument {
     private(set) var scale: CGFloat
     private(set) var annotations: [Annotation] = []
     private(set) var redoAnnotations: [Annotation] = []
+    private(set) var appearance = CaptureAppearance()
 
     init(frame: CapturedFrame) {
         baseImage = frame.image
@@ -19,7 +20,7 @@ final class CaptureDocument {
     var hasAnnotations: Bool { !annotations.isEmpty }
     var nextSerialNumber: Int {
         let numbers = annotations.compactMap { annotation -> Int? in
-            if case .serial(_, let number) = annotation.kind { return number }
+            if case .serial(_, let number, _) = annotation.kind { return number }
             return nil
         }
         return (numbers.max() ?? 0) + 1
@@ -58,5 +59,9 @@ final class CaptureDocument {
         scale = frame.scale
         annotations.removeAll()
         redoAnnotations.removeAll()
+    }
+
+    func setAppearance(_ appearance: CaptureAppearance) {
+        self.appearance = appearance
     }
 }

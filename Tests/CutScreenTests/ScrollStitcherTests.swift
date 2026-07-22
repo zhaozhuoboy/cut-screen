@@ -16,7 +16,8 @@ final class ScrollStitcherTests: XCTestCase {
 
         let match = GrayFrameMatcher.bestVerticalShift(previous: first, current: second)
         XCTAssertEqual(match?.shift, shift)
-        XCTAssertGreaterThan(match?.confidence ?? 0, 0.85)
+        XCTAssertGreaterThan(match?.confidence ?? 0, 0.80)
+        XCTAssertLessThan(match?.difference ?? 255, 1)
     }
 
     func testRejectsMismatchedDimensions() {
@@ -57,6 +58,80 @@ final class ScrollStitcherTests: XCTestCase {
         XCTAssertLessThan(GrayFrameMatcher.meanDifference(expectedGray, resultGray, shift: 0), 2)
     }
 
+    func testMatchesTextPageWithFixedHeaderAndSidebar() {
+        let width = 240
+        let height = 300
+        let pixelShift = 64
+        let first = makeTextPageViewport(width: width, height: height, rowOffset: 0)
+        let second = makeTextPageViewport(width: width, height: height, rowOffset: pixelShift)
+        let firstGray = GrayFrame(image: first)
+        let secondGray = GrayFrame(image: second)
+
+        let match = GrayFrameMatcher.bestVerticalShift(previous: firstGray, current: secondGray)
+        let expected = Int(Double(pixelShift) * Double(firstGray.height) / Double(height))
+
+        XCTAssertNotNil(match)
+        XCTAssertLessThanOrEqual(abs((match?.shift ?? 0) - expected), 2)
+        XCTAssertLessThan(match?.difference ?? 255, 20)
+
+        let stitcher = IncrementalScrollStitcher()
+        XCTAssertEqual(stitcher.append(first), .firstFrame)
+        guard case .appended(let added, _) = stitcher.append(second) else {
+            return XCTFail("Text page frame should append")
+        }
+        XCTAssertLessThanOrEqual(abs(added - pixelShift), 4)
+    }
+
+    func testRejectsFrameWithoutVerticalOverlap() {
+        let first = makeTextPageViewport(width: 240, height: 300, rowOffset: 0)
+        let unrelated = makeTextPageViewport(width: 240, height: 300, rowOffset: 420)
+        let stitcher = IncrementalScrollStitcher()
+
+        XCTAssertEqual(stitcher.append(first), .firstFrame)
+        XCTAssertEqual(stitcher.append(unrelated), .noMatch)
+    }
+
+    func testAppendsTextPageAtDifferentScrollSpeeds() {
+        let width = 240
+        let height = 300
+        let offsets = [0, 18, 72, 150]
+        let stitcher = IncrementalScrollStitcher()
+
+        XCTAssertEqual(
+            stitcher.append(makeTextPageViewport(width: width, height: height, rowOffset: offsets[0])),
+            .firstFrame
+        )
+        for (previous, current) in zip(offsets, offsets.dropFirst()) {
+            let result = stitcher.append(makeTextPageViewport(width: width, height: height, rowOffset: current))
+            guard case .appended(let added, _) = result else {
+                return XCTFail("Frame at offset \(current) should append, got \(result)")
+            }
+            XCTAssertLessThanOrEqual(abs(added - (current - previous)), 2)
+        }
+
+        XCTAssertLessThanOrEqual(abs(stitcher.totalPixelHeight - (height + offsets.last!)), 4)
+    }
+
+    func testLivePreviewAddsOnlyNewlyStitchedStrip() throws {
+        let first = makeImage(width: 100, height: 80, rowOffset: 0)
+        let second = makeImage(width: 100, height: 80, rowOffset: 20)
+        let composer = ScrollPreviewComposer(maximumWidth: 50)
+
+        let initial = try XCTUnwrap(composer.update(frame: first, result: .firstFrame))
+        XCTAssertEqual(initial.width, 50)
+        XCTAssertEqual(initial.height, 40)
+
+        let accumulated = try XCTUnwrap(composer.update(
+            frame: second,
+            result: .appended(pixelHeight: 20, confidence: 0.9)
+        ))
+        XCTAssertEqual(accumulated.width, 50)
+        XCTAssertEqual(accumulated.height, 50)
+
+        let duplicate = try XCTUnwrap(composer.update(frame: second, result: .duplicate))
+        XCTAssertTrue(duplicate === accumulated)
+    }
+
     private func makeImage(width: Int, height: Int, rowOffset: Int = 0) -> CGImage {
         var bytes = [UInt8](repeating: 255, count: width * height * 4)
         for row in 0..<height {
@@ -73,6 +148,61 @@ final class ScrollStitcherTests: XCTestCase {
         }
         let data = Data(bytes)
         let provider = CGDataProvider(data: data as CFData)!
+        return CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).union(.byteOrder32Big),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )!
+    }
+
+    private func makeTextPageViewport(width: Int, height: Int, rowOffset: Int) -> CGImage {
+        var bytes = [UInt8](repeating: 255, count: width * height * 4)
+        let headerHeight = max(20, height / 10)
+        let sidebarWidth = max(18, width / 10)
+
+        for row in 0..<height {
+            for column in 0..<width {
+                let offset = (row * width + column) * 4
+                let pageRow = row + rowOffset
+                let value: UInt8
+
+                if row < headerHeight {
+                    value = column < width / 3 ? 58 : 82
+                } else if column >= width - sidebarWidth {
+                    value = row % 34 < 3 ? 174 : 226
+                } else {
+                    let line = pageRow / 26
+                    let rowInLine = pageRow % 26
+                    var lineHash = UInt32(truncatingIfNeeded: line) &* 2_654_435_761
+                    lineHash ^= lineHash >> 13
+                    lineHash &*= 1_103_515_245
+                    let lineRange = max(80, width - sidebarWidth - 80)
+                    let lineEnd = 70 + Int(lineHash % UInt32(lineRange))
+                    if (4...6).contains(rowInLine), column >= 24, column < lineEnd {
+                        value = 38
+                    } else if (11...18).contains(rowInLine), column >= 24, column < 46 {
+                        value = UInt8(95 + Int(lineHash % 80))
+                    } else {
+                        value = 248
+                    }
+                }
+
+                bytes[offset] = value
+                bytes[offset + 1] = value
+                bytes[offset + 2] = value
+                bytes[offset + 3] = 255
+            }
+        }
+
+        let provider = CGDataProvider(data: Data(bytes) as CFData)!
         return CGImage(
             width: width,
             height: height,

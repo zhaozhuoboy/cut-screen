@@ -10,7 +10,9 @@ final class CaptureOverlayController: NSWindowController {
         display: CapturedDisplay,
         onSelection: @escaping (CapturedDisplay, CGRect) -> Void,
         onSelectionAdjusted: @escaping (CGRect) -> Void,
+        onSelectionAdjustmentStateChanged: @escaping (Bool) -> Void,
         onDocumentChanged: @escaping () -> Void,
+        onConfirm: @escaping () -> Void,
         onCancel: @escaping () -> Void
     ) {
         self.display = display
@@ -33,7 +35,9 @@ final class CaptureOverlayController: NSWindowController {
         super.init(window: panel)
         overlayView.onSelection = { rect in onSelection(display, rect) }
         overlayView.onSelectionAdjusted = onSelectionAdjusted
+        overlayView.onSelectionAdjustmentStateChanged = onSelectionAdjustmentStateChanged
         overlayView.onDocumentChanged = onDocumentChanged
+        overlayView.onConfirm = onConfirm
         overlayView.onCancel = onCancel
     }
 
@@ -51,10 +55,12 @@ private final class CaptureOverlayWindow: NSPanel {
 }
 
 @MainActor
-final class CaptureOverlayView: NSView {
+final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     var onSelection: ((CGRect) -> Void)?
     var onSelectionAdjusted: ((CGRect) -> Void)?
+    var onSelectionAdjustmentStateChanged: ((Bool) -> Void)?
     var onDocumentChanged: (() -> Void)?
+    var onConfirm: (() -> Void)?
     var onCancel: (() -> Void)?
 
     private enum Mode { case selecting, editing }
@@ -80,8 +86,12 @@ final class CaptureOverlayView: NSView {
     private var previewAnnotation: Annotation?
     private var tool: EditorTool = .none
     private var style = AnnotationStyle()
+    private var mosaicConfiguration = MosaicConfiguration()
     private var scrollOffsetFromTop: CGFloat = 0
-    private var pixelatedImage: NSImage?
+    private var obscuredPreviewImages: [MosaicPreviewKey: NSImage] = [:]
+    private var serialTextField: NSTextField?
+    private var editingSerialID: UUID?
+    private var selectionAdjustmentIsActive = false
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     init(display: CapturedDisplay) {
@@ -97,13 +107,14 @@ final class CaptureOverlayView: NSView {
     var currentDocument: CaptureDocument? { document }
 
     func beginEditing(document: CaptureDocument, selectionRect: CGRect) {
+        dismissSerialTextField()
         self.document = document
         self.selectionRect = selectionRect
         mode = .editing
         interaction = .none
         hoveredWindowRect = nil
         scrollOffsetFromTop = 0
-        pixelatedImage = nil
+        obscuredPreviewImages.removeAll()
         needsDisplay = true
     }
 
@@ -117,19 +128,30 @@ final class CaptureOverlayView: NSView {
         self.style = style
     }
 
+    func setMosaicConfiguration(_ configuration: MosaicConfiguration) {
+        mosaicConfiguration = configuration
+    }
+
+    func refreshAppearance() {
+        needsDisplay = true
+    }
+
     func undo() {
+        commitSerialTextEditing()
         document?.undo()
         selectedAnnotationID = nil
         notifyDocumentChanged()
     }
 
     func redo() {
+        commitSerialTextEditing()
         document?.redo()
         notifyDocumentChanged()
     }
 
     func deleteSelection() {
         guard let selectedAnnotationID else { return }
+        if editingSerialID == selectedAnnotationID { dismissSerialTextField() }
         document?.remove(id: selectedAnnotationID)
         self.selectedAnnotationID = nil
         notifyDocumentChanged()
@@ -148,19 +170,42 @@ final class CaptureOverlayView: NSView {
             return
         }
 
+        let cornerRadius = min(
+            (mode == .editing ? document?.appearance.cornerRadius ?? 0 : 0) * displayScale,
+            min(focusRect.width, focusRect.height) / 2
+        )
+        let focusPath = cornerRadius > 0
+            ? NSBezierPath(roundedRect: focusRect.pixelAligned, xRadius: cornerRadius, yRadius: cornerRadius)
+            : NSBezierPath(rect: focusRect.pixelAligned)
+
+        if mode == .editing, let appearance = document?.appearance, appearance.hasShadow {
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(appearance.previewShadowOpacity)
+            shadow.shadowBlurRadius = appearance.shadowBlurRadius
+            shadow.shadowOffset = CGSize(width: 0, height: appearance.shadowOffsetY)
+            shadow.set()
+            NSColor.black.withAlphaComponent(appearance.previewShadowFillOpacity).setFill()
+            focusPath.fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
         NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(rect: focusRect).addClip()
+        focusPath.addClip()
         if mode == .editing, document != nil {
-            drawDocument(in: focusRect)
+            if isAdjustingSelection, document?.hasAnnotations == false {
+                drawFrozenScreenPreview(in: focusRect)
+            } else {
+                drawDocument(in: focusRect)
+            }
         } else {
             fullImage.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
         }
         NSGraphicsContext.restoreGraphicsState()
 
-        let border = NSBezierPath(rect: focusRect.pixelAligned)
-        border.lineWidth = 1
-        NSColor.systemBlue.setStroke()
-        border.stroke()
+        focusPath.lineWidth = selectionRect == nil ? 3 : 2.5
+        NSColor.systemGreen.setStroke()
+        focusPath.stroke()
 
         if selectionRect != nil {
             drawSizeLabel(for: focusRect)
@@ -176,8 +221,15 @@ final class CaptureOverlayView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
+
+        if mode == .editing, event.clickCount == 2, selectionRect?.contains(point) == true {
+            commitSerialTextEditing()
+            onConfirm?()
+            return
+        }
+
+        window?.makeFirstResponder(self)
 
         switch mode {
         case .selecting:
@@ -212,6 +264,7 @@ final class CaptureOverlayView: NSView {
             self.document?.replace(resized)
             selectedAnnotationID = id
         case .movingSelection(let original, let start):
+            setSelectionAdjustmentActive(true)
             let delta = CGPoint(x: point.x - start.x, y: point.y - start.y)
             var moved = original.offsetBy(dx: delta.x, dy: delta.y)
             if moved.minX < bounds.minX { moved.origin.x = bounds.minX }
@@ -220,6 +273,7 @@ final class CaptureOverlayView: NSView {
             if moved.maxY > bounds.maxY { moved.origin.y = bounds.maxY - moved.height }
             selectionRect = moved
         case .resizingSelection(let handle, let original, let start):
+            setSelectionAdjustmentActive(true)
             selectionRect = resizedSelection(original, handle: handle, delta: CGPoint(x: point.x - start.x, y: point.y - start.y))
         case .none:
             break
@@ -230,6 +284,7 @@ final class CaptureOverlayView: NSView {
     override func mouseUp(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         defer {
+            setSelectionAdjustmentActive(false)
             interaction = .none
             previewAnnotation = nil
             needsDisplay = true
@@ -255,7 +310,16 @@ final class CaptureOverlayView: NSView {
             if let selectionRect, selectionRect.width >= 8, selectionRect.height >= 8 {
                 onSelectionAdjusted?(selectionRect)
             }
-        case .movingAnnotation, .resizingAnnotation:
+        case .movingAnnotation(let id, _, let start):
+            let current = viewToDocument(point) ?? start
+            if hypot(current.x - start.x, current.y - start.y) < 2,
+               let annotation = document?.annotations.first(where: { $0.id == id }),
+               case .serial = annotation.kind {
+                beginSerialTextEditing(annotation)
+            } else {
+                notifyDocumentChanged()
+            }
+        case .resizingAnnotation:
             notifyDocumentChanged()
         case .none:
             break
@@ -288,22 +352,128 @@ final class CaptureOverlayView: NSView {
         super.keyDown(with: event)
     }
 
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard notification.object as? NSTextField === serialTextField else { return }
+        commitSerialTextEditing()
+    }
+
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:))
+            || commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            commitSerialTextEditing()
+            return true
+        }
+        return false
+    }
+
+    private func beginSerialTextEditing(_ annotation: Annotation) {
+        commitSerialTextEditing()
+        guard case .serial(let center, _, let text) = annotation.kind,
+              let selectionRect else { return }
+
+        let viewCenter = documentToView(center)
+        let markerRadius = SerialAnnotationMetrics.radius(lineWidth: annotation.style.lineWidth) * displayScale
+        let fontSize = SerialAnnotationMetrics.noteFontSize(lineWidth: annotation.style.lineWidth) * displayScale
+        let height = max(28, fontSize + 9)
+        var x = viewCenter.x + markerRadius + SerialAnnotationMetrics.noteGap * displayScale
+        var width = min(240, selectionRect.maxX - x - 8)
+        if width < 110 {
+            x = max(selectionRect.minX + 8, viewCenter.x - 250)
+            width = min(220, selectionRect.maxX - x - 8)
+        }
+        width = max(90, width)
+        let minimumY = selectionRect.minY + 6
+        let maximumY = max(minimumY, selectionRect.maxY - height - 6)
+        let y = min(max(
+            minimumY,
+            viewCenter.y - height / 2 + SerialAnnotationMetrics.editorVerticalOffset * displayScale
+        ), maximumY)
+
+        let field = NSTextField(frame: CGRect(x: x, y: y, width: width, height: height))
+        field.stringValue = text
+        field.font = .systemFont(
+            ofSize: fontSize,
+            weight: .medium
+        )
+        field.textColor = annotation.style.color.nsColor
+        field.isBezeled = false
+        field.isBordered = false
+        field.drawsBackground = false
+        field.backgroundColor = .clear
+        field.focusRingType = .none
+        field.maximumNumberOfLines = 1
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.delegate = self
+        field.target = self
+        field.action = #selector(commitSerialTextFromField(_:))
+
+        serialTextField = field
+        editingSerialID = annotation.id
+        addSubview(field)
+        window?.makeFirstResponder(field)
+        if let editor = field.currentEditor() as? NSTextView {
+            editor.drawsBackground = false
+            editor.backgroundColor = .clear
+            editor.insertionPointColor = annotation.style.color.nsColor
+            editor.selectedRange = NSRange(location: text.count, length: 0)
+        }
+    }
+
+    @objc private func commitSerialTextFromField(_ sender: NSTextField) {
+        commitSerialTextEditing()
+    }
+
+    private func commitSerialTextEditing() {
+        guard let field = serialTextField, let id = editingSerialID else { return }
+        let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = String(trimmed.prefix(60))
+        dismissSerialTextField()
+
+        guard var annotation = document?.annotations.first(where: { $0.id == id }),
+              case .serial(let center, let number, _) = annotation.kind else { return }
+        annotation.kind = .serial(center: center, number: number, text: text)
+        document?.replace(annotation)
+        selectedAnnotationID = id
+        notifyDocumentChanged()
+        window?.makeFirstResponder(self)
+    }
+
+    private func dismissSerialTextField() {
+        serialTextField?.delegate = nil
+        serialTextField?.removeFromSuperview()
+        serialTextField = nil
+        editingSerialID = nil
+    }
+
     private func beginEditingInteraction(at viewPoint: CGPoint) {
         guard let document, let selectionRect, selectionRect.contains(viewPoint), let documentPoint = viewToDocument(viewPoint) else { return }
 
+        if let selectedAnnotationID,
+           let selected = document.annotations.first(where: { $0.id == selectedAnnotationID }),
+           let handle = annotationHandle(at: viewPoint, annotation: selected) {
+            interaction = .resizingAnnotation(id: selected.id, original: selected, handle: handle, start: documentPoint)
+            return
+        }
+
+        if let annotation = document.annotations.reversed().first(where: {
+            AnnotationPainter.hitTest($0, point: documentPoint)
+        }) {
+            selectedAnnotationID = annotation.id
+            interaction = .movingAnnotation(id: annotation.id, original: annotation, start: documentPoint)
+            needsDisplay = true
+            return
+        }
+
         if tool == .none {
-            if let selectedAnnotationID,
-               let selected = document.annotations.first(where: { $0.id == selectedAnnotationID }),
-               let handle = annotationHandle(at: viewPoint, annotation: selected) {
-                interaction = .resizingAnnotation(id: selected.id, original: selected, handle: handle, start: documentPoint)
-                return
-            }
-            if let annotation = document.annotations.reversed().first(where: { AnnotationPainter.hitTest($0, point: documentPoint) }) {
-                selectedAnnotationID = annotation.id
-                interaction = .movingAnnotation(id: annotation.id, original: annotation, start: documentPoint)
-            } else if !document.hasAnnotations, let handle = selectionHandle(at: viewPoint) {
+            let canAdjustSelection = canAdjustSelection(document: document, selectionRect: selectionRect)
+            if canAdjustSelection, let handle = selectionHandle(at: viewPoint) {
                 interaction = .resizingSelection(handle: handle, original: selectionRect, start: viewPoint)
-            } else if !document.hasAnnotations {
+            } else if canAdjustSelection {
                 selectedAnnotationID = nil
                 interaction = .movingSelection(original: selectionRect, start: viewPoint)
             } else {
@@ -315,17 +485,29 @@ final class CaptureOverlayView: NSView {
 
         if tool == .serial {
             let annotation = Annotation(
-                kind: .serial(center: documentPoint, number: document.nextSerialNumber),
+                kind: .serial(center: documentPoint, number: document.nextSerialNumber, text: ""),
                 style: style
             )
             document.add(annotation)
             selectedAnnotationID = annotation.id
             notifyDocumentChanged()
+            beginSerialTextEditing(annotation)
             return
         }
 
         interaction = .drawing(start: documentPoint, points: [documentPoint])
         updatePreview(start: documentPoint, current: documentPoint, points: [documentPoint])
+    }
+
+    private func drawFrozenScreenPreview(in rect: CGRect) {
+        fullImage.draw(
+            in: rect,
+            from: rect,
+            operation: .copy,
+            fraction: 1,
+            respectFlipped: false,
+            hints: [.interpolation: NSImageInterpolation.high]
+        )
     }
 
     private func updatePreview(start: CGPoint, current: CGPoint, points: [CGPoint]) {
@@ -335,7 +517,13 @@ final class CaptureOverlayView: NSView {
         case .ellipse: kind = .ellipse(rect(from: start, to: current))
         case .pencil: kind = .pencil(points)
         case .arrow: kind = .arrow(start: start, end: current)
-        case .mosaic: kind = .mosaic(points)
+        case .magnifier:
+            kind = .magnifier(rect: rect(from: start, to: current), zoom: 2)
+        case .mosaic:
+            let shape: MosaicShape = mosaicConfiguration.drawingMode == .brush
+                ? .brush(points)
+                : .rectangle(rect(from: start, to: current))
+            kind = .mosaic(MosaicAnnotation(effect: mosaicConfiguration.effect, shape: shape))
         default: return
         }
         if let previewAnnotation {
@@ -360,36 +548,116 @@ final class CaptureOverlayView: NSView {
             self?.documentToView(point) ?? .zero
         }
         for annotation in document.annotations where !self.isMosaic(annotation) {
-            AnnotationPainter.draw(annotation, in: context, transform: transform, scale: displayScale)
+            let displayedAnnotation = annotationForDisplay(annotation)
+            if isMagnifier(displayedAnnotation) {
+                drawMagnifier(displayedAnnotation, image: image, in: rect, source: source, context: context)
+            }
+            AnnotationPainter.draw(displayedAnnotation, in: context, transform: transform, scale: displayScale)
         }
         if let previewAnnotation, !isMosaic(previewAnnotation) {
+            if isMagnifier(previewAnnotation) {
+                drawMagnifier(previewAnnotation, image: image, in: rect, source: source, context: context)
+            }
             AnnotationPainter.draw(previewAnnotation, in: context, transform: transform, scale: displayScale)
         }
 
-        if let selectedAnnotationID,
+        if let selectedAnnotationID, editingSerialID != selectedAnnotationID,
            let selected = document.annotations.first(where: { $0.id == selectedAnnotationID }) {
             drawAnnotationSelection(selected)
         }
     }
 
+    private func drawMagnifier(
+        _ annotation: Annotation,
+        image: NSImage,
+        in rect: CGRect,
+        source: CGRect,
+        context: CGContext
+    ) {
+        guard case .magnifier(let lensRect, let zoom) = annotation.kind else { return }
+        let first = documentToView(lensRect.origin)
+        let second = documentToView(CGPoint(x: lensRect.maxX, y: lensRect.maxY))
+        let lens = CGRect(
+            x: min(first.x, second.x),
+            y: min(first.y, second.y),
+            width: abs(second.x - first.x),
+            height: abs(second.y - first.y)
+        )
+        guard lens.width > 1, lens.height > 1 else { return }
+
+        context.saveGState()
+        context.addEllipse(in: lens)
+        context.clip()
+        context.translateBy(x: lens.midX, y: lens.midY)
+        context.scaleBy(x: max(1, zoom), y: max(1, zoom))
+        context.translateBy(x: -lens.midX, y: -lens.midY)
+        image.draw(
+            in: rect,
+            from: source,
+            operation: .copy,
+            fraction: 1,
+            respectFlipped: false,
+            hints: [.interpolation: NSImageInterpolation.high]
+        )
+        context.restoreGState()
+    }
+
     private func drawMosaicAnnotations(_ annotations: [Annotation], in rect: CGRect, source: CGRect) {
         guard let document, let context = NSGraphicsContext.current?.cgContext else { return }
-        if pixelatedImage == nil {
-            let input = CIImage(cgImage: document.baseImage)
-            let amount = max(8, min(input.extent.width, input.extent.height) / 120)
-            if let output = CIFilter(name: "CIPixellate", parameters: [kCIInputImageKey: input, kCIInputScaleKey: amount])?.outputImage,
-               let image = ciContext.createCGImage(output, from: input.extent) {
-                pixelatedImage = NSImage(cgImage: image, size: document.pointSize)
-            }
-        }
-        guard let pixelatedImage else { return }
         let transform: AnnotationPainter.PointTransform = { [weak self] point in self?.documentToView(point) ?? .zero }
         for annotation in annotations where isMosaic(annotation) {
+            guard case .mosaic(let mosaic) = annotation.kind,
+                  let obscuredImage = obscuredPreviewImage(
+                    effect: mosaic.effect,
+                    lineWidth: annotation.style.lineWidth,
+                    document: document
+                  ) else { continue }
             context.saveGState()
             AnnotationPainter.mosaicClipPath(for: annotation, in: context, transform: transform, scale: displayScale)
-            pixelatedImage.draw(in: rect, from: source, operation: .copy, fraction: 1, respectFlipped: false, hints: [.interpolation: NSImageInterpolation.none])
+            obscuredImage.draw(
+                in: rect,
+                from: source,
+                operation: .copy,
+                fraction: 1,
+                respectFlipped: false,
+                hints: [.interpolation: mosaic.effect == .pixelate ? NSImageInterpolation.none : .high]
+            )
             context.restoreGState()
         }
+    }
+
+    private func obscuredPreviewImage(
+        effect: MosaicEffect,
+        lineWidth: CGFloat,
+        document: CaptureDocument
+    ) -> NSImage? {
+        let key = MosaicPreviewKey(effect: effect, lineWidth: Int(lineWidth.rounded()))
+        if let cached = obscuredPreviewImages[key] { return cached }
+
+        let input = CIImage(cgImage: document.baseImage)
+        let multiplier: CGFloat = lineWidth <= 2 ? 0.8 : (lineWidth >= 8 ? 1.8 : 1.2)
+        let baseAmount = max(6, min(input.extent.width, input.extent.height) / 120)
+        let output: CIImage?
+        switch effect {
+        case .pixelate:
+            output = CIFilter(
+                name: "CIPixellate",
+                parameters: [kCIInputImageKey: input, kCIInputScaleKey: baseAmount * multiplier]
+            )?.outputImage?.cropped(to: input.extent)
+        case .blur:
+            output = CIFilter(
+                name: "CIGaussianBlur",
+                parameters: [
+                    kCIInputImageKey: input.clampedToExtent(),
+                    kCIInputRadiusKey: baseAmount * multiplier
+                ]
+            )?.outputImage?.cropped(to: input.extent)
+        }
+        guard let output,
+              let cgImage = ciContext.createCGImage(output, from: input.extent) else { return nil }
+        let image = NSImage(cgImage: cgImage, size: document.pointSize)
+        obscuredPreviewImages[key] = image
+        return image
     }
 
     private func drawAnnotationSelection(_ annotation: Annotation) {
@@ -405,9 +673,7 @@ final class CaptureOverlayView: NSView {
         path.lineWidth = 1
         NSColor.controlAccentColor.setStroke()
         path.stroke()
-        if case .rectangle = annotation.kind {
-            drawAnnotationHandles(for: viewBounds)
-        } else if case .ellipse = annotation.kind {
+        if isResizableAnnotation(annotation) {
             drawAnnotationHandles(for: viewBounds)
         }
     }
@@ -460,8 +726,7 @@ final class CaptureOverlayView: NSView {
     }
 
     private func annotationHandle(at point: CGPoint, annotation: Annotation) -> ResizeHandle? {
-        switch annotation.kind {
-        case .rectangle, .ellipse:
+        if isResizableAnnotation(annotation) {
             let bounds = annotation.kind.bounds
             let first = documentToView(bounds.origin)
             let second = documentToView(CGPoint(x: bounds.maxX, y: bounds.maxY))
@@ -470,9 +735,8 @@ final class CaptureOverlayView: NSView {
                 width: abs(second.x - first.x), height: abs(second.y - first.y)
             )
             return ResizeHandle.allCases.first { handleRect($0, selection: viewBounds).insetBy(dx: -4, dy: -4).contains(point) }
-        default:
-            return nil
         }
+        return nil
     }
 
     private func resizedAnnotation(_ annotation: Annotation, handle: ResizeHandle, delta: CGPoint, documentSize: CGSize) -> Annotation {
@@ -485,6 +749,13 @@ final class CaptureOverlayView: NSView {
             changed.kind = .rectangle(resizedBounds)
         case .ellipse:
             changed.kind = .ellipse(resizedBounds)
+        case .magnifier(_, let zoom):
+            changed.kind = .magnifier(rect: resizedBounds, zoom: zoom)
+        case .mosaic(var mosaic):
+            if case .rectangle = mosaic.shape {
+                mosaic.shape = .rectangle(resizedBounds)
+                changed.kind = .mosaic(mosaic)
+            }
         default:
             break
         }
@@ -511,12 +782,12 @@ final class CaptureOverlayView: NSView {
 
     private func drawSelectionHandles(for selection: CGRect) {
         NSColor.white.setFill()
-        NSColor.systemBlue.setStroke()
+        NSColor.systemGreen.setStroke()
         for handle in ResizeHandle.allCases {
             let rect = handleRect(handle, selection: selection)
-            let path = NSBezierPath(rect: rect)
+            let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
             path.fill()
-            path.lineWidth = 1
+            path.lineWidth = 1.5
             path.stroke()
         }
     }
@@ -545,7 +816,7 @@ final class CaptureOverlayView: NSView {
         case .topLeft: point = CGPoint(x: selection.minX, y: selection.maxY)
         case .left: point = CGPoint(x: selection.minX, y: selection.midY)
         }
-        return CGRect(x: point.x - 3, y: point.y - 3, width: 6, height: 6)
+        return CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)
     }
 
     private func drawHint(_ text: String) {
@@ -564,17 +835,65 @@ final class CaptureOverlayView: NSView {
             .foregroundColor: NSColor.white,
             .backgroundColor: NSColor.black.withAlphaComponent(0.65)
         ]
-        size.draw(at: CGPoint(x: rect.minX, y: min(bounds.maxY - 18, rect.maxY + 4)), withAttributes: attributes)
+        let below = rect.minY - 18
+        let y = below >= bounds.minY + 4 ? below : min(bounds.maxY - 18, rect.maxY + 4)
+        size.draw(at: CGPoint(x: rect.minX, y: y), withAttributes: attributes)
     }
 
     private func notifyDocumentChanged() {
-        pixelatedImage = nil
+        obscuredPreviewImages.removeAll()
         needsDisplay = true
         onDocumentChanged?()
     }
 
+    private func isResizableAnnotation(_ annotation: Annotation) -> Bool {
+        switch annotation.kind {
+        case .rectangle, .ellipse, .magnifier:
+            return true
+        case .mosaic(let mosaic):
+            if case .rectangle = mosaic.shape { return true }
+            return false
+        default:
+            return false
+        }
+    }
+
+    private var isAdjustingSelection: Bool {
+        switch interaction {
+        case .movingSelection, .resizingSelection:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func setSelectionAdjustmentActive(_ active: Bool) {
+        guard selectionAdjustmentIsActive != active else { return }
+        selectionAdjustmentIsActive = active
+        onSelectionAdjustmentStateChanged?(active)
+    }
+
+    private func canAdjustSelection(document: CaptureDocument, selectionRect: CGRect) -> Bool {
+        !document.hasAnnotations
+            && abs(document.pointSize.width - selectionRect.width) < 1
+            && abs(document.pointSize.height - selectionRect.height) < 1
+    }
+
     private func isMosaic(_ annotation: Annotation) -> Bool {
         if case .mosaic = annotation.kind { return true }
+        return false
+    }
+
+    private func annotationForDisplay(_ annotation: Annotation) -> Annotation {
+        guard editingSerialID == annotation.id,
+              case .serial(let center, let number, _) = annotation.kind else { return annotation }
+        var displayed = annotation
+        displayed.kind = .serial(center: center, number: number, text: "")
+        return displayed
+    }
+
+    private func isMagnifier(_ annotation: Annotation) -> Bool {
+        if case .magnifier = annotation.kind { return true }
         return false
     }
 
@@ -584,6 +903,11 @@ final class CaptureOverlayView: NSView {
             width: abs(second.x - first.x), height: abs(second.y - first.y)
         )
     }
+}
+
+private struct MosaicPreviewKey: Hashable {
+    let effect: MosaicEffect
+    let lineWidth: Int
 }
 
 private extension CGRect {

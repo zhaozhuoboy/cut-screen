@@ -3,6 +3,7 @@
 import CoreImage
 import CoreMedia
 import CoreVideo
+import OSLog
 
 final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let selection: Selection
@@ -10,10 +11,15 @@ final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @u
     private let processingQueue = DispatchQueue(label: "com.cutscreen.scroll-capture", qos: .userInitiated)
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let stitcher: any ScrollStitching
+    private let previewComposer = ScrollPreviewComposer()
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "CutScreen", category: "ScrollCapture")
     private var stream: SCStream?
     private var stopped = false
+    private var receivedFrameCount = 0
+    private var appendedFrameCount = 0
+    private var noMatchCount = 0
 
-    var onProgress: (@MainActor (StitchAppendResult, Int) -> Void)?
+    var onProgress: (@MainActor (StitchAppendResult, Int, CGImage?) -> Void)?
     var onFailure: (@MainActor (any Error) -> Void)?
 
     init(selection: Selection, scale: CGFloat, stitcher: any ScrollStitching = IncrementalScrollStitcher()) {
@@ -41,8 +47,11 @@ final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @u
         )
         configuration.width = max(1, Int(selection.localRect.width * scale))
         configuration.height = max(1, Int(selection.localRect.height * scale))
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 8)
-        configuration.queueDepth = 1
+        // Trackpad scrolling can move hundreds of pixels between 12 fps samples.
+        // A 30 fps stream keeps enough overlap for stitching while the queue stays
+        // small enough to avoid retaining a large set of full-resolution frames.
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        configuration.queueDepth = 2
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.showsCursor = false
         configuration.capturesAudio = false
@@ -52,6 +61,9 @@ final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @u
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: processingQueue)
         self.stream = stream
         try await stream.startCapture()
+        logger.info(
+            "Scroll stream started: \(configuration.width)x\(configuration.height), source=\(String(describing: configuration.sourceRect), privacy: .public)"
+        )
     }
 
     func stop() async throws -> CGImage {
@@ -61,7 +73,11 @@ final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @u
         await withCheckedContinuation { continuation in
             processingQueue.async { continuation.resume() }
         }
-        return try stitcher.finalize()
+        let image = try stitcher.finalize()
+        logger.info(
+            "Scroll stream finished: received=\(self.receivedFrameCount), appended=\(self.appendedFrameCount), noMatch=\(self.noMatchCount), height=\(image.height)"
+        )
+        return image
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
@@ -83,8 +99,23 @@ final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @u
 
         let input = CIImage(cvPixelBuffer: imageBuffer)
         guard let image = ciContext.createCGImage(input, from: input.extent) else { return }
+        receivedFrameCount += 1
         let result = stitcher.append(image)
+        switch result {
+        case .appended:
+            appendedFrameCount += 1
+        case .noMatch:
+            noMatchCount += 1
+            if noMatchCount == 1 || noMatchCount.isMultiple(of: 15) {
+                logger.warning(
+                    "Unable to match scroll frame: received=\(self.receivedFrameCount), totalHeight=\(self.stitcher.totalPixelHeight)"
+                )
+            }
+        default:
+            break
+        }
         let totalHeight = stitcher.totalPixelHeight
-        Task { @MainActor [weak self] in self?.onProgress?(result, totalHeight) }
+        let preview = previewComposer.update(frame: image, result: result)
+        Task { @MainActor [weak self] in self?.onProgress?(result, totalHeight, preview) }
     }
 }

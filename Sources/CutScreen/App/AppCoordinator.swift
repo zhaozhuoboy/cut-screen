@@ -7,6 +7,7 @@ final class AppCoordinator {
     private let settings = AppSettings()
     private let hotKeyManager = GlobalHotKeyManager()
     private lazy var captureCoordinator = CaptureCoordinator()
+    private lazy var permissionGuideController = ScreenCapturePermissionGuideController()
     private lazy var statusBarController = StatusBarController(
         onCapture: { [weak self] in self?.handleCaptureShortcut() },
         onSettings: { [weak self] in self?.showSettings() },
@@ -23,10 +24,12 @@ final class AppCoordinator {
             self?.handleCaptureShortcut()
         }
         registerSavedHotKey()
+        permissionGuideController.presentIfNeeded()
     }
 
     func stop() {
         captureCoordinator.cancel()
+        permissionGuideController.close()
         hotKeyManager.unregister()
     }
 

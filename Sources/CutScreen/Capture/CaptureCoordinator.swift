@@ -25,8 +25,10 @@ final class CaptureCoordinator {
     private var selection: Selection?
     private var document: CaptureDocument?
     private var toolbarController: CaptureToolbarController?
+    private var appearanceToolbarController: CaptureAppearanceToolbarController?
     private var scrollSession: ScrollCaptureSession?
     private var scrollHUD: ScrollCaptureHUDController?
+    private var sourceApplication: NSRunningApplication?
 
     init() {
         let detector = SystemWindowDetector()
@@ -37,6 +39,10 @@ final class CaptureCoordinator {
 
     func begin() {
         guard state == .idle else { return }
+        if let frontmost = NSWorkspace.shared.frontmostApplication,
+           frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            sourceApplication = frontmost
+        }
         state = .permission
 
         guard captureService.hasPermission() else {
@@ -65,7 +71,7 @@ final class CaptureCoordinator {
 
     func finishScrolling() async {
         guard state == .scrolling, let session = scrollSession,
-              let selection, let activeDisplay, let activeOverlay else { return }
+              let selection, let activeDisplay, let document else { return }
         state = .exporting
         scrollHUD?.close()
         scrollHUD = nil
@@ -78,18 +84,17 @@ final class CaptureCoordinator {
                 pointSize: CGSize(width: selection.localRect.width, height: CGFloat(image.height) / activeDisplay.scale),
                 scale: activeDisplay.scale
             )
-            document?.replaceBase(with: frame)
-            if let document {
-                activeOverlay.beginEditing(document: document, selectionRect: selection.localRect)
-            }
-            activeOverlay.window?.orderFrontRegardless()
-            toolbarController?.window?.orderFrontRegardless()
-            toolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
-            toolbarController?.setScrollEnabled(false)
-            state = .editing
-            NSApplication.shared.activate(ignoringOtherApps: true)
+            document.replaceBase(with: frame)
+            let data = try exporter.data(for: document, format: .png)
+            guard pasteboard.writePNG(data) else { throw ImageExportError.encoding }
+            finishSession()
         } catch {
-            restoreEditorAfterScrollFailure(error)
+            restoreEditorAfterScrollFailure(
+                error,
+                title: document.pointSize.height > selection.localRect.height + 1
+                    ? "复制长截图失败"
+                    : "滚动长截图失败"
+            )
         }
     }
 
@@ -103,7 +108,11 @@ final class CaptureCoordinator {
                     display: display,
                     onSelection: { [weak self] display, rect in self?.commitSelection(display: display, localRect: rect) },
                     onSelectionAdjusted: { [weak self] rect in self?.adjustSelection(to: rect) },
+                    onSelectionAdjustmentStateChanged: { [weak self] active in
+                        self?.selectionAdjustmentStateChanged(isActive: active)
+                    },
                     onDocumentChanged: { [weak self] in self?.documentChanged() },
+                    onConfirm: { [weak self] in self?.copyAndFinish() },
                     onCancel: { [weak self] in self?.cancel() }
                 )
             }
@@ -132,9 +141,13 @@ final class CaptureCoordinator {
         overlayControllers = [activeOverlay].compactMap { $0 }
         activeOverlay?.beginEditing(document: document, selectionRect: localRect)
         installToolbar()
+        installAppearanceToolbar()
         toolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
         toolbarController?.showWindow(nil)
         toolbarController?.window?.orderFrontRegardless()
+        appearanceToolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
+        appearanceToolbarController?.showWindow(nil)
+        appearanceToolbarController?.window?.orderFrontRegardless()
         state = .editing
     }
 
@@ -145,8 +158,27 @@ final class CaptureCoordinator {
         let frame = CapturedFrame(image: image, pointSize: localRect.size, scale: activeDisplay.scale)
         document?.replaceBase(with: frame)
         if let document { activeOverlay?.beginEditing(document: document, selectionRect: localRect) }
-        if let selection { toolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame) }
+        if let selection {
+            toolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
+            appearanceToolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
+        }
         documentChanged()
+    }
+
+    private func selectionAdjustmentStateChanged(isActive: Bool) {
+        guard state == .editing else { return }
+        if isActive {
+            toolbarController?.hideStylePanel()
+            toolbarController?.window?.orderOut(nil)
+            appearanceToolbarController?.window?.orderOut(nil)
+            return
+        }
+
+        guard let selection else { return }
+        toolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
+        appearanceToolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
+        toolbarController?.window?.orderFrontRegardless()
+        appearanceToolbarController?.window?.orderFrontRegardless()
     }
 
     private func installToolbar() {
@@ -154,6 +186,9 @@ final class CaptureCoordinator {
         toolbarController = CaptureToolbarController(actions: .init(
             toolChanged: { [weak self] tool in self?.activeOverlay?.overlayView.setTool(tool) },
             styleChanged: { [weak self] style in self?.activeOverlay?.overlayView.setStyle(style) },
+            mosaicConfigurationChanged: { [weak self] configuration in
+                self?.activeOverlay?.overlayView.setMosaicConfiguration(configuration)
+            },
             undo: { [weak self] in self?.activeOverlay?.overlayView.undo() },
             redo: { [weak self] in self?.activeOverlay?.overlayView.redo() },
             scroll: { [weak self] in self?.startScrolling() },
@@ -163,6 +198,14 @@ final class CaptureCoordinator {
             confirm: { [weak self] in self?.copyAndFinish() }
         ))
         documentChanged()
+    }
+
+    private func installAppearanceToolbar() {
+        guard appearanceToolbarController == nil else { return }
+        appearanceToolbarController = CaptureAppearanceToolbarController { [weak self] appearance in
+            self?.document?.setAppearance(appearance)
+            self?.activeOverlay?.overlayView.refreshAppearance()
+        }
     }
 
     private func documentChanged() {
@@ -175,15 +218,17 @@ final class CaptureCoordinator {
         guard state == .editing, let document, !document.hasAnnotations,
               let selection, let activeDisplay else { return }
         state = .scrolling
+        toolbarController?.hideStylePanel()
         activeOverlay?.window?.orderOut(nil)
         toolbarController?.window?.orderOut(nil)
+        appearanceToolbarController?.window?.orderOut(nil)
 
         let session = ScrollCaptureSession(selection: selection, scale: activeDisplay.scale)
         let hud = ScrollCaptureHUDController(selection: selection) { [weak self] in
             Task { await self?.finishScrolling() }
         }
-        session.onProgress = { [weak hud] result, totalHeight in
-            hud?.update(result: result, totalHeight: totalHeight)
+        session.onProgress = { [weak hud] result, totalHeight, preview in
+            hud?.update(result: result, totalHeight: totalHeight, preview: preview)
         }
         session.onFailure = { [weak self] error in
             self?.restoreEditorAfterScrollFailure(error)
@@ -195,20 +240,32 @@ final class CaptureCoordinator {
         Task {
             do {
                 try await session.start()
+                sourceApplication?.activate(options: [.activateIgnoringOtherApps])
             } catch {
                 restoreEditorAfterScrollFailure(error)
             }
         }
     }
 
-    private func restoreEditorAfterScrollFailure(_ error: any Error) {
+    private func restoreEditorAfterScrollFailure(
+        _ error: any Error,
+        title: String = "滚动长截图失败"
+    ) {
         scrollHUD?.close()
         scrollHUD = nil
         scrollSession = nil
+        if let document, let selection {
+            activeOverlay?.beginEditing(document: document, selectionRect: selection.localRect)
+            toolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
+            appearanceToolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
+        }
         activeOverlay?.window?.orderFrontRegardless()
         toolbarController?.window?.orderFrontRegardless()
+        appearanceToolbarController?.window?.orderFrontRegardless()
         state = .editing
-        ErrorPresenter.show(title: "滚动长截图失败", error: error)
+        documentChanged()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        ErrorPresenter.show(title: title, error: error)
     }
 
     private func copyAndFinish() {
@@ -228,6 +285,7 @@ final class CaptureCoordinator {
         guard state == .editing, let document else { return }
         activeOverlay?.window?.orderOut(nil)
         toolbarController?.window?.orderOut(nil)
+        appearanceToolbarController?.window?.orderOut(nil)
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png, .jpeg]
         panel.canCreateDirectories = true
@@ -254,7 +312,10 @@ final class CaptureCoordinator {
         state = .exporting
         do {
             let image = try exporter.render(document)
-            let pointSize = document.pointSize
+            let pointSize = CGSize(
+                width: CGFloat(image.width) / document.scale,
+                height: CGFloat(image.height) / document.scale
+            )
             finishSession()
             pinManager.pin(image, pointSize: pointSize)
         } catch {
@@ -266,6 +327,7 @@ final class CaptureCoordinator {
     private func finishSession() {
         scrollHUD?.close()
         toolbarController?.close()
+        appearanceToolbarController?.close()
         for controller in overlayControllers { controller.close() }
         overlayControllers.removeAll()
         activeOverlay = nil
@@ -273,14 +335,17 @@ final class CaptureCoordinator {
         selection = nil
         document = nil
         toolbarController = nil
+        appearanceToolbarController = nil
         scrollSession = nil
         scrollHUD = nil
+        sourceApplication = nil
         state = .idle
     }
 
     private func restoreEditingWindows() {
         activeOverlay?.window?.orderFrontRegardless()
         toolbarController?.window?.orderFrontRegardless()
+        appearanceToolbarController?.window?.orderFrontRegardless()
         activeOverlay?.window?.makeKey()
     }
 

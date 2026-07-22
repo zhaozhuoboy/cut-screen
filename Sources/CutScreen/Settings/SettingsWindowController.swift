@@ -41,6 +41,7 @@ final class SettingsWindowController: NSWindowController {
         let title = NSTextField(labelWithString: "全局截图快捷键")
         title.font = .systemFont(ofSize: 14, weight: .medium)
         shortcutButton.bezelStyle = .rounded
+        shortcutButton.toolTip = "修改全局截图快捷键"
         shortcutButton.target = self
         shortcutButton.action = #selector(recordShortcut)
         shortcutButton.widthAnchor.constraint(equalToConstant: 110).isActive = true
@@ -51,6 +52,7 @@ final class SettingsWindowController: NSWindowController {
 
         loginCheckbox.target = self
         loginCheckbox.action = #selector(toggleLoginItem)
+        loginCheckbox.toolTip = "设置轻截是否随登录自动启动"
 
         messageLabel.textColor = .secondaryLabelColor
         messageLabel.maximumNumberOfLines = 2

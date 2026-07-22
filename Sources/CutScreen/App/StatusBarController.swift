@@ -16,7 +16,12 @@ final class StatusBarController: NSObject {
 
     func install() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "轻截")
+        let statusIcon = ToolbarIconProvider.image(
+            named: "status-viewfinder-bolt",
+            accessibilityDescription: "轻截"
+        )
+        statusIcon?.size = CGSize(width: 18, height: 18)
+        item.button?.image = statusIcon
         item.button?.toolTip = "轻截"
 
         let menu = NSMenu()
@@ -28,6 +33,10 @@ final class StatusBarController: NSObject {
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(settings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
+
+        let feedbackItem = NSMenuItem(title: "反馈", action: #selector(feedback), keyEquivalent: "")
+        feedbackItem.target = self
+        menu.addItem(feedbackItem)
 
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "退出轻截", action: #selector(quit), keyEquivalent: "q")
@@ -54,5 +63,9 @@ final class StatusBarController: NSObject {
 
     @objc private func capture() { onCapture() }
     @objc private func settings() { onSettings() }
+    @objc private func feedback() {
+        guard let url = URL(string: "https://my.feishu.cn/share/base/form/shrcn4PO31W5r1nKbtg4xmMuw7f") else { return }
+        NSWorkspace.shared.open(url)
+    }
     @objc private func quit() { onQuit() }
 }

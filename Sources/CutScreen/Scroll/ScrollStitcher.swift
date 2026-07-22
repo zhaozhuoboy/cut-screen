@@ -14,6 +14,79 @@ protocol ScrollStitching: AnyObject {
     func finalize() throws -> CGImage
 }
 
+/// Builds a lightweight, downsampled copy of the accumulated long screenshot
+/// for the live HUD. The full-resolution document remains disk-backed in the
+/// stitcher, so showing progress does not duplicate the entire capture in RAM.
+final class ScrollPreviewComposer {
+    private let maximumWidth: Int
+    private var strips: [CGImage] = []
+    private(set) var image: CGImage?
+
+    init(maximumWidth: Int = 220) {
+        self.maximumWidth = max(1, maximumWidth)
+    }
+
+    func update(frame: CGImage, result: StitchAppendResult) -> CGImage? {
+        let source: CGImage?
+        switch result {
+        case .firstFrame:
+            strips.removeAll(keepingCapacity: true)
+            source = frame
+        case .appended(let pixelHeight, _):
+            let height = min(max(1, pixelHeight), frame.height)
+            source = frame.cropping(to: CGRect(
+                x: 0,
+                y: frame.height - height,
+                width: frame.width,
+                height: height
+            ))
+        case .duplicate, .noMatch, .limitReached:
+            return image
+        }
+
+        guard let source, let strip = downsample(source) else { return image }
+        strips.append(strip)
+        image = composeStrips()
+        return image
+    }
+
+    private func downsample(_ source: CGImage) -> CGImage? {
+        let width = min(maximumWidth, source.width)
+        let scale = CGFloat(width) / CGFloat(source.width)
+        let height = max(1, Int((CGFloat(source.height) * scale).rounded()))
+        guard let context = makeContext(width: width, height: height) else { return nil }
+        context.interpolationQuality = .medium
+        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+
+    private func composeStrips() -> CGImage? {
+        guard let width = strips.first?.width else { return nil }
+        let height = strips.reduce(0) { $0 + $1.height }
+        guard let context = makeContext(width: width, height: height) else { return nil }
+        context.interpolationQuality = .medium
+
+        var top = height
+        for strip in strips {
+            top -= strip.height
+            context.draw(strip, in: CGRect(x: 0, y: top, width: strip.width, height: strip.height))
+        }
+        return context.makeImage()
+    }
+
+    private func makeContext(width: Int, height: Int) -> CGContext? {
+        CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )
+    }
+}
+
 enum ScrollStitchError: LocalizedError {
     case noFrames
     case inconsistentWidth
@@ -64,12 +137,13 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
         guard image.width == previousImage.width else { return .noMatch }
 
         let currentGray = GrayFrame(image: image)
-        if GrayFrameMatcher.meanDifference(previousGray, currentGray, shift: 0) < 1.5 {
+        if GrayFrameMatcher.meanDifference(previousGray, currentGray, shift: 0) < 1.2 {
             return .duplicate
         }
 
         guard let match = GrayFrameMatcher.bestVerticalShift(previous: previousGray, current: currentGray),
-              match.confidence >= 0.86 else {
+              match.difference <= 24,
+              match.confidence >= 0.58 else {
             return .noMatch
         }
 
@@ -158,10 +232,11 @@ struct GrayFrame: Equatable, Sendable {
         self.pixels = pixels
     }
 
-    init(image: CGImage, targetWidth: Int = 96, maximumHeight: Int = 240) {
+    init(image: CGImage, targetWidth: Int = 96, maximumHeight: Int = 360) {
         let width = min(targetWidth, image.width)
-        let proportionalHeight = max(1, Int(Double(image.height) * Double(width) / Double(max(image.width, 1))))
-        let height = min(maximumHeight, proportionalHeight)
+        // Keep substantially more vertical detail than horizontal detail. Scroll
+        // matching depends on accurate row displacement, not image aspect ratio.
+        let height = min(maximumHeight, image.height)
         var pixels = [UInt8](repeating: 0, count: width * height)
         let colorSpace = CGColorSpaceCreateDeviceGray()
         pixels.withUnsafeMutableBytes { bytes in
@@ -185,6 +260,7 @@ enum GrayFrameMatcher {
     struct Match: Equatable, Sendable {
         let shift: Int
         let confidence: Double
+        let difference: Double
     }
 
     static func bestVerticalShift(previous: GrayFrame, current: GrayFrame) -> Match? {
@@ -192,27 +268,32 @@ enum GrayFrameMatcher {
               previous.height == current.height,
               previous.height >= 12 else { return nil }
 
-        let minimumShift = max(2, previous.height / 40)
-        let maximumShift = max(minimumShift, Int(Double(previous.height) * 0.82))
-        var bestShift = 0
-        var bestDifference = Double.greatestFiniteMagnitude
-        var secondBest = Double.greatestFiniteMagnitude
+        let minimumShift = max(1, previous.height / 120)
+        // Keep a small but useful overlap even when a trackpad gesture advances
+        // almost a full viewport between two processed frames.
+        let maximumShift = max(minimumShift, Int(Double(previous.height) * 0.95))
+        var candidates: [(shift: Int, difference: Double)] = []
 
         for shift in minimumShift...maximumShift {
             let difference = meanDifference(previous, current, shift: shift)
-            if difference < bestDifference {
-                secondBest = bestDifference
-                bestDifference = difference
-                bestShift = shift
-            } else if difference < secondBest {
-                secondBest = difference
-            }
+            candidates.append((shift, difference))
         }
 
-        let similarity = max(0, 1 - bestDifference / 255)
-        let uniqueness = secondBest.isFinite ? min(1, max(0, (secondBest - bestDifference) / 12)) : 1
-        let confidence = similarity * 0.88 + uniqueness * 0.12
-        return Match(shift: bestShift, confidence: confidence)
+        guard let minimumDifference = candidates.map(\.difference).min() else { return nil }
+        let nearBestTolerance = max(0.65, minimumDifference * 0.05)
+        guard let best = candidates.first(where: { $0.difference <= minimumDifference + nearBestTolerance }) else {
+            return nil
+        }
+
+        let separationDistance = max(2, previous.height / 50)
+        let secondBest = candidates
+            .filter { abs($0.shift - best.shift) > separationDistance }
+            .map(\.difference)
+            .min() ?? 255
+        let similarity = max(0, 1 - best.difference / 48)
+        let uniqueness = min(1, max(0, (secondBest - best.difference) / 8))
+        let confidence = similarity * 0.82 + uniqueness * 0.18
+        return Match(shift: best.shift, confidence: confidence, difference: best.difference)
     }
 
     static func meanDifference(_ previous: GrayFrame, _ current: GrayFrame, shift: Int) -> Double {
@@ -220,19 +301,26 @@ enum GrayFrameMatcher {
         let overlap = previous.height - shift
         guard overlap > 4 else { return 255 }
 
-        // Ignore the leading part of the new frame so sticky headers don't dominate matching.
-        let startRow = min(max(0, current.height / 10), overlap - 1)
-        let endRow = max(startRow + 1, overlap - max(1, current.height / 30))
-        var total: Int64 = 0
+        // Ignore common sticky headers/footers and page sidebars. RMS difference
+        // keeps sparse text edges meaningful on otherwise white pages.
+        let startRow = min(max(0, min(current.height / 6, overlap / 4)), overlap - 1)
+        let endRow = max(startRow + 1, overlap - max(1, min(current.height / 12, overlap / 5)))
+        let startColumn = current.width / 10
+        let endColumn = max(startColumn + 1, current.width - current.width / 10)
+        var squaredTotal: Int64 = 0
         var count: Int64 = 0
         for row in startRow..<endRow {
             let previousOffset = (row + shift) * previous.width
             let currentOffset = row * current.width
-            for column in stride(from: 0, to: current.width, by: 2) {
-                total += Int64(abs(Int(previous.pixels[previousOffset + column]) - Int(current.pixels[currentOffset + column])))
+            for column in stride(from: startColumn, to: endColumn, by: 2) {
+                let difference = Int64(
+                    Int(previous.pixels[previousOffset + column])
+                        - Int(current.pixels[currentOffset + column])
+                )
+                squaredTotal += difference * difference
                 count += 1
             }
         }
-        return count > 0 ? Double(total) / Double(count) : 255
+        return count > 0 ? sqrt(Double(squaredTotal) / Double(count)) : 255
     }
 }
