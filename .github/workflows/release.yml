@@ -1,0 +1,193 @@
+name: 发布 macOS 正式包
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，例如 1.1.0"
+        required: true
+        default: "1.0.2"
+        type: string
+      build_number:
+        description: "构建号，只能填写正整数"
+        required: true
+        default: "3"
+        type: string
+      package_mode:
+        description: "未签名包无需证书；签名公证包可直接分发"
+        required: true
+        default: unsigned
+        type: choice
+        options:
+          - unsigned
+          - signed-notarized
+      prerelease:
+        description: "标记为预发布版本"
+        required: true
+        default: false
+        type: boolean
+      release_notes:
+        description: "发布说明；留空时自动生成"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ inputs.version }}
+      BUILD_NUMBER: ${{ inputs.build_number }}
+      PACKAGE_MODE: ${{ inputs.package_mode }}
+      RELEASE_NOTES: ${{ inputs.release_notes }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 校验发布参数
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version 必须是 x.y.z 格式，例如 1.1.0"
+            exit 1
+          fi
+          if [[ ! "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "build_number 必须是正整数"
+            exit 1
+          fi
+          if git rev-parse "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "标签 v${VERSION} 已存在，请使用新的版本号"
+            exit 1
+          fi
+          swift --version
+          xcodebuild -version
+
+      - name: 写入应用版本
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" Resources/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" Resources/Info.plist
+          plutil -lint Resources/Info.plist
+
+      - name: 运行测试
+        run: swift test
+
+      - name: 导入 Developer ID 证书
+        if: inputs.package_mode == 'signed-notarized'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${MACOS_CERTIFICATE:?缺少 MACOS_CERTIFICATE Secret}"
+          : "${MACOS_CERTIFICATE_PASSWORD:?缺少 MACOS_CERTIFICATE_PASSWORD Secret}"
+          : "${KEYCHAIN_PASSWORD:?缺少 KEYCHAIN_PASSWORD Secret}"
+
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/cutscreen-signing.keychain-db"
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$certificate_path"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" login.keychain-db
+
+          signing_identity="$(security find-identity -v -p codesigning "$keychain_path" \
+            | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' \
+            | head -n 1)"
+          if [[ -z "$signing_identity" ]]; then
+            echo "证书中没有可用的 Developer ID Application 身份"
+            exit 1
+          fi
+          echo "SIGNING_IDENTITY=$signing_identity" >> "$GITHUB_ENV"
+
+      - name: 配置未签名构建
+        if: inputs.package_mode == 'unsigned'
+        run: echo 'SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+
+      - name: 构建通用应用和 DMG
+        env:
+          BUILD_ARCHS: universal
+        run: make dmg
+
+      - name: 校验应用架构和签名
+        shell: bash
+        run: |
+          set -euo pipefail
+          architectures="$(lipo -archs build/CutScreen.app/Contents/MacOS/CutScreen)"
+          [[ "$architectures" == *arm64* && "$architectures" == *x86_64* ]]
+          codesign --verify --deep --strict --verbose=2 build/CutScreen.app
+
+      - name: Apple 公证并装订凭证
+        if: inputs.package_mode == 'signed-notarized'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./Scripts/notarize.sh "build/CutScreen-${VERSION}.dmg"
+
+      - name: 整理发布文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_path="build/CutScreen-${VERSION}.dmg"
+          if [[ "$PACKAGE_MODE" == "unsigned" ]]; then
+            asset_path="build/CutScreen-${VERSION}-unsigned.dmg"
+            mv "$source_path" "$asset_path"
+          else
+            asset_path="$source_path"
+          fi
+          shasum -a 256 "$asset_path" > "${asset_path}.sha256"
+          echo "ASSET_PATH=$asset_path" >> "$GITHUB_ENV"
+
+      - name: 创建 GitHub Release
+        shell: bash
+        env:
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          release_args=(
+            "$tag"
+            "$ASSET_PATH"
+            "${ASSET_PATH}.sha256"
+            --target "$GITHUB_SHA"
+            --title "轻截 ${tag}"
+          )
+
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          if [[ -n "$RELEASE_NOTES" ]]; then
+            notes_path="$RUNNER_TEMP/release-notes.md"
+            printf '%s\n' "$RELEASE_NOTES" > "$notes_path"
+            release_args+=(--notes-file "$notes_path")
+          else
+            release_args+=(--generate-notes)
+          fi
+
+          gh release create "${release_args[@]}"

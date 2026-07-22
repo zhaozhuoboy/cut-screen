@@ -54,6 +54,26 @@ make dmg
 
 正式发布所需的签名身份和公证凭据应配置在本机环境或钥匙串中，不要提交到版本库。
 
+### 从 GitHub Actions 手动发布
+
+仓库的“Actions → 发布 macOS 正式包 → Run workflow”支持手动生成通用版 DMG，并创建对应的 GitHub Release。发布时填写版本号、构建号并选择打包模式：
+
+- `unsigned`：无需配置证书。生成的文件名带 `-unsigned`，适合发给朋友内测；首次打开可能需要右键选择“打开”，并在系统“隐私与安全性”中确认。
+- `signed-notarized`：使用 Developer ID 签名并提交 Apple 公证，适合正式对外分发。
+
+签名公证模式需要在仓库的“Settings → Secrets and variables → Actions”中配置以下 Secrets：
+
+| Secret | 内容 |
+|---|---|
+| `MACOS_CERTIFICATE` | Developer ID Application `.p12` 文件的 Base64 文本 |
+| `MACOS_CERTIFICATE_PASSWORD` | 导出 `.p12` 时设置的密码 |
+| `KEYCHAIN_PASSWORD` | CI 临时钥匙串密码，可自行生成一个强密码 |
+| `APPLE_ID` | Apple Developer 账号邮箱 |
+| `APPLE_TEAM_ID` | Apple Developer Team ID |
+| `APPLE_APP_SPECIFIC_PASSWORD` | Apple ID 的 App 专用密码 |
+
+可在 macOS 上使用 `base64 -i DeveloperID.p12 | pbcopy` 生成证书 Secret。未签名模式不会读取上述 Secrets。
+
 ## 使用说明
 
 1. 按 `⌃⌘A` 或点击菜单栏“开始截图”。

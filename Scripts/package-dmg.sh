@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="${0:A:h}"
 PROJECT_DIR="${SCRIPT_DIR:h}"
 APP_PATH="${PROJECT_DIR}/build/CutScreen.app"
+SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
 STAGING_DIR="$(mktemp -d)"
 trap 'rm -rf "${STAGING_DIR}"' EXIT
 
@@ -24,5 +25,10 @@ hdiutil create \
   -ov \
   -format UDZO \
   "${DMG_PATH}"
+
+if [[ "${SIGNING_IDENTITY}" != "-" ]]; then
+  codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${DMG_PATH}"
+  codesign --verify --verbose=2 "${DMG_PATH}"
+fi
 
 echo "已生成安装镜像: ${DMG_PATH}"
