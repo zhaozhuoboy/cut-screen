@@ -2,17 +2,24 @@ import AppKit
 
 @MainActor
 final class ScrollCaptureHUDController {
+    private let onSave: () -> Void
+    private let onCancel: () -> Void
     private let onFinish: () -> Void
     private let borderWindow: NSPanel
     private let controlWindow: NSPanel
     private let previewWindow: NSPanel
-    private let label = NSTextField(labelWithString: "向下滚动页面，结束后复制长图")
-    private let previewHeightLabel = NSTextField(labelWithString: "正在获取起始画面…")
     private let previewScrollView = NSScrollView()
     private let previewImageView = FlippedPreviewImageView()
-    private var didRequestFinish = false
+    private var didRequestAction = false
 
-    init(selection: Selection, onFinish: @escaping () -> Void) {
+    init(
+        selection: Selection,
+        onSave: @escaping () -> Void,
+        onCancel: @escaping () -> Void,
+        onFinish: @escaping () -> Void
+    ) {
+        self.onSave = onSave
+        self.onCancel = onCancel
         self.onFinish = onFinish
         borderWindow = NSPanel(
             contentRect: selection.globalRect,
@@ -31,7 +38,7 @@ final class ScrollCaptureHUDController {
         borderWindow.contentView?.layer?.borderColor = NSColor.systemGreen.cgColor
 
         controlWindow = NSPanel(
-            contentRect: CGRect(x: 0, y: 0, width: 300, height: 46),
+            contentRect: CGRect(x: 0, y: 0, width: 122, height: 44),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -42,6 +49,7 @@ final class ScrollCaptureHUDController {
         controlWindow.hasShadow = true
         controlWindow.hidesOnDeactivate = false
         controlWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let controlContent = GlassToolbarComponents.configure(controlWindow, cornerRadius: 12)
 
         let previewHeight = min(520, max(280, selection.screenFrame.height - 96))
         previewWindow = NSPanel(
@@ -54,25 +62,31 @@ final class ScrollCaptureHUDController {
         previewWindow.hidesOnDeactivate = false
         let previewContent = GlassToolbarComponents.configure(previewWindow, cornerRadius: 13)
 
-        let finish = NSButton(title: "完成并复制", target: nil, action: nil)
-        finish.toolTip = "结束滚动截图并复制到剪贴板"
-        let stack = NSStackView(views: [label, finish])
+        let save = actionButton(icon: "save", tooltip: "保存长截图", action: #selector(saveCapture))
+        let cancel = actionButton(icon: "cancel", tooltip: "取消长截图", action: #selector(cancelCapture))
+        let finish = actionButton(icon: "confirm", tooltip: "完成并复制", action: #selector(finishCapture))
+        finish.isPrimaryAction = true
+        let stack = NSStackView(views: [save, cancel, finish])
         stack.orientation = .horizontal
         stack.alignment = .centerY
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 7, left: 10, bottom: 7, right: 10)
-        stack.wantsLayer = true
-        stack.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
-        stack.layer?.cornerRadius = 8
-        finish.target = self
-        finish.action = #selector(finishCapture)
-        controlWindow.contentView = stack
+        stack.spacing = 3
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        controlContent.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: controlContent.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: controlContent.centerYAnchor)
+        ])
 
         buildPreview(in: previewContent)
 
-        let desiredX = min(selection.globalRect.maxX - 300, selection.screenFrame.maxX - 308)
+        let desiredX = min(
+            selection.globalRect.maxX - controlWindow.frame.width,
+            selection.screenFrame.maxX - controlWindow.frame.width - 8
+        )
         var desiredY = selection.globalRect.maxY + 8
-        if desiredY + 46 > selection.screenFrame.maxY { desiredY = selection.globalRect.minY - 54 }
+        if desiredY + controlWindow.frame.height > selection.screenFrame.maxY {
+            desiredY = selection.globalRect.minY - controlWindow.frame.height - 8
+        }
         controlWindow.setFrameOrigin(CGPoint(x: max(selection.screenFrame.minX + 8, desiredX), y: max(selection.screenFrame.minY + 8, desiredY)))
 
         let previewMargin: CGFloat = 12
@@ -98,25 +112,10 @@ final class ScrollCaptureHUDController {
         previewWindow.orderFrontRegardless()
     }
 
-    func update(result: StitchAppendResult, totalHeight: Int, preview: CGImage?) {
-        if let preview { updatePreviewImage(preview, totalHeight: totalHeight) }
-        switch result {
-        case .noMatch:
-            label.stringValue = "未识别到连续内容，请放慢滚动"
-            label.textColor = .systemOrange
-        case .limitReached:
-            label.stringValue = "已达到长图上限，正在完成"
-            label.textColor = .systemOrange
+    func update(result: StitchAppendResult, totalHeight _: Int, preview: CGImage?) {
+        if let preview { updatePreviewImage(preview) }
+        if case .limitReached = result {
             requestFinishOnce()
-        case .duplicate:
-            label.stringValue = "等待页面向下滚动 · 已捕获 \(formatted(totalHeight)) px"
-            label.textColor = .secondaryLabelColor
-        case .firstFrame:
-            label.stringValue = "已捕获起始画面，请向下滚动页面"
-            label.textColor = .labelColor
-        case .appended(let added, _):
-            label.stringValue = "新增 \(formatted(added)) px · 累计 \(formatted(totalHeight)) px"
-            label.textColor = .labelColor
         }
     }
 
@@ -130,14 +129,6 @@ final class ScrollCaptureHUDController {
         let title = NSTextField(labelWithString: "长截图实时预览")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         title.textColor = .labelColor
-
-        previewHeightLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        previewHeightLabel.textColor = .secondaryLabelColor
-        previewHeightLabel.alignment = .right
-
-        let header = NSStackView(views: [title, NSView(), previewHeightLabel])
-        header.orientation = .horizontal
-        header.alignment = .centerY
 
         // The first frame is usually much shorter than the preview viewport.
         // Preserve its aspect ratio and leave the remaining area empty instead
@@ -158,7 +149,7 @@ final class ScrollCaptureHUDController {
         previewScrollView.layer?.cornerCurve = .continuous
         previewScrollView.layer?.masksToBounds = true
 
-        let stack = NSStackView(views: [header, previewScrollView])
+        let stack = NSStackView(views: [title, previewScrollView])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
@@ -169,12 +160,11 @@ final class ScrollCaptureHUDController {
             stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -10),
             stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 10),
             stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10),
-            header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             previewScrollView.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
     }
 
-    private func updatePreviewImage(_ image: CGImage, totalHeight: Int) {
+    private func updatePreviewImage(_ image: CGImage) {
         let contentWidth = max(1, previewScrollView.contentSize.width)
         let displayHeight = max(
             previewScrollView.contentSize.height,
@@ -182,7 +172,6 @@ final class ScrollCaptureHUDController {
         )
         previewImageView.image = NSImage(cgImage: image, size: CGSize(width: image.width, height: image.height))
         previewImageView.frame = CGRect(x: 0, y: 0, width: contentWidth, height: displayHeight)
-        previewHeightLabel.stringValue = "\(formatted(totalHeight)) px"
         previewScrollView.layoutSubtreeIfNeeded()
         previewScrollView.contentView.scroll(to: CGPoint(
             x: 0,
@@ -192,13 +181,33 @@ final class ScrollCaptureHUDController {
     }
 
     private func requestFinishOnce() {
-        guard !didRequestFinish else { return }
-        didRequestFinish = true
+        guard !didRequestAction else { return }
+        didRequestAction = true
         onFinish()
     }
 
-    private func formatted(_ value: Int) -> String {
-        value.formatted(.number.grouping(.automatic))
+    private func actionButton(icon: String, tooltip: String, action: Selector) -> GlassToolbarButton {
+        let button = GlassToolbarButton()
+        button.image = ToolbarIconProvider.image(named: icon, accessibilityDescription: tooltip)
+        button.imagePosition = .imageOnly
+        button.target = self
+        button.action = action
+        button.toolTip = tooltip
+        button.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        return button
+    }
+
+    @objc private func saveCapture() {
+        guard !didRequestAction else { return }
+        didRequestAction = true
+        onSave()
+    }
+
+    @objc private func cancelCapture() {
+        guard !didRequestAction else { return }
+        didRequestAction = true
+        onCancel()
     }
 
     @objc private func finishCapture() { requestFinishOnce() }

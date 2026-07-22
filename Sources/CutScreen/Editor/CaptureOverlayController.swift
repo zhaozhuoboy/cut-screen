@@ -28,6 +28,7 @@ final class CaptureOverlayController: NSWindowController {
         panel.isOpaque = true
         panel.backgroundColor = .black
         panel.hasShadow = false
+        panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.acceptsMouseMovedEvents = true
         panel.contentView = overlayView
@@ -44,8 +45,19 @@ final class CaptureOverlayController: NSWindowController {
     required init?(coder: NSCoder) { nil }
 
     func beginEditing(document: CaptureDocument, selectionRect: CGRect) {
+        window?.ignoresMouseEvents = false
+        window?.isOpaque = true
+        window?.backgroundColor = .black
         overlayView.beginEditing(document: document, selectionRect: selectionRect)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    func beginScrollingMask(selectionRect: CGRect) {
+        window?.isOpaque = false
+        window?.backgroundColor = .clear
+        window?.ignoresMouseEvents = true
+        overlayView.beginScrollingMask(selectionRect: selectionRect)
+        window?.orderFrontRegardless()
     }
 }
 
@@ -63,7 +75,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     var onConfirm: (() -> Void)?
     var onCancel: (() -> Void)?
 
-    private enum Mode { case selecting, editing }
+    private enum Mode { case selecting, editing, scrolling }
     private enum ResizeHandle: CaseIterable { case bottomLeft, bottom, bottomRight, right, topRight, top, topLeft, left }
     private enum Interaction {
         case none
@@ -118,6 +130,16 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         needsDisplay = true
     }
 
+    func beginScrollingMask(selectionRect: CGRect) {
+        dismissSerialTextField()
+        self.selectionRect = selectionRect
+        mode = .scrolling
+        interaction = .none
+        selectedAnnotationID = nil
+        previewAnnotation = nil
+        needsDisplay = true
+    }
+
     func setTool(_ tool: EditorTool) {
         self.tool = tool
         selectedAnnotationID = nil
@@ -159,6 +181,12 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+
+        if mode == .scrolling {
+            drawScrollingMask()
+            return
+        }
+
         fullImage.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
 
         NSColor.black.withAlphaComponent(0.52).setFill()
@@ -220,6 +248,25 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         needsDisplay = true
     }
 
+    private func drawScrollingMask() {
+        guard let selectionRect,
+              let context = NSGraphicsContext.current?.cgContext else { return }
+
+        // Keep the original frozen screen outside the selection, exactly like
+        // regular capture mode, then punch a transparent hole through which the
+        // live source application can scroll. The window ignores mouse events,
+        // so trackpad and wheel input reaches the application underneath.
+        context.clear(bounds)
+        fullImage.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
+        NSColor.black.withAlphaComponent(0.52).setFill()
+        bounds.fill()
+
+        context.saveGState()
+        context.setBlendMode(.clear)
+        context.fill(selectionRect.pixelAligned)
+        context.restoreGState()
+    }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
 
@@ -237,6 +284,8 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
             selectionRect = CGRect(origin: point, size: .zero)
         case .editing:
             beginEditingInteraction(at: point)
+        case .scrolling:
+            break
         }
     }
 

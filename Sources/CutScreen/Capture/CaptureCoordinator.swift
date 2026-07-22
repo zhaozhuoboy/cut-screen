@@ -70,6 +70,14 @@ final class CaptureCoordinator {
     }
 
     func finishScrolling() async {
+        await completeScrolling(saveToFile: false)
+    }
+
+    private func saveScrolling() async {
+        await completeScrolling(saveToFile: true)
+    }
+
+    private func completeScrolling(saveToFile: Bool) async {
         guard state == .scrolling, let session = scrollSession,
               let selection, let activeDisplay, let document else { return }
         state = .exporting
@@ -85,14 +93,29 @@ final class CaptureCoordinator {
                 scale: activeDisplay.scale
             )
             document.replaceBase(with: frame)
-            let data = try exporter.data(for: document, format: .png)
-            guard pasteboard.writePNG(data) else { throw ImageExportError.encoding }
+            if saveToFile {
+                activeOverlay?.window?.orderOut(nil)
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                let panel = NSSavePanel()
+                panel.allowedContentTypes = [.png, .jpeg]
+                panel.canCreateDirectories = true
+                panel.nameFieldStringValue = ScreenshotFileName.make(extension: "png")
+                guard panel.runModal() == .OK, let url = panel.url else {
+                    restoreEditingAfterScroll()
+                    return
+                }
+                let format: ExportFormat = ["jpg", "jpeg"].contains(url.pathExtension.lowercased()) ? .jpeg : .png
+                try exporter.data(for: document, format: format).write(to: url, options: .atomic)
+            } else {
+                let data = try exporter.data(for: document, format: .png)
+                guard pasteboard.writePNG(data) else { throw ImageExportError.encoding }
+            }
             finishSession()
         } catch {
             restoreEditorAfterScrollFailure(
                 error,
                 title: document.pointSize.height > selection.localRect.height + 1
-                    ? "复制长截图失败"
+                    ? (saveToFile ? "保存长截图失败" : "复制长截图失败")
                     : "滚动长截图失败"
             )
         }
@@ -219,14 +242,17 @@ final class CaptureCoordinator {
               let selection, let activeDisplay else { return }
         state = .scrolling
         toolbarController?.hideStylePanel()
-        activeOverlay?.window?.orderOut(nil)
+        activeOverlay?.beginScrollingMask(selectionRect: selection.localRect)
         toolbarController?.window?.orderOut(nil)
         appearanceToolbarController?.window?.orderOut(nil)
 
         let session = ScrollCaptureSession(selection: selection, scale: activeDisplay.scale)
-        let hud = ScrollCaptureHUDController(selection: selection) { [weak self] in
-            Task { await self?.finishScrolling() }
-        }
+        let hud = ScrollCaptureHUDController(
+            selection: selection,
+            onSave: { [weak self] in Task { await self?.saveScrolling() } },
+            onCancel: { [weak self] in self?.cancel() },
+            onFinish: { [weak self] in Task { await self?.finishScrolling() } }
+        )
         session.onProgress = { [weak hud] result, totalHeight, preview in
             hud?.update(result: result, totalHeight: totalHeight, preview: preview)
         }
@@ -251,6 +277,11 @@ final class CaptureCoordinator {
         _ error: any Error,
         title: String = "滚动长截图失败"
     ) {
+        restoreEditingAfterScroll()
+        ErrorPresenter.show(title: title, error: error)
+    }
+
+    private func restoreEditingAfterScroll() {
         scrollHUD?.close()
         scrollHUD = nil
         scrollSession = nil
@@ -265,7 +296,6 @@ final class CaptureCoordinator {
         state = .editing
         documentChanged()
         NSApplication.shared.activate(ignoringOtherApps: true)
-        ErrorPresenter.show(title: title, error: error)
     }
 
     private func copyAndFinish() {
