@@ -41,24 +41,15 @@ swift build
 swift test
 ```
 
-## 签名、DMG 和公证
+## 发布构建
 
-不设置签名身份时，`make app` 使用 ad-hoc 签名，适合本机开发。正式发布时传入 Developer ID：
+本地开发默认使用 ad-hoc 签名。DMG 可通过以下命令生成：
 
 ```bash
-SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" make app
 make dmg
-NOTARY_PROFILE=cutscreen-notary Scripts/notarize.sh
 ```
 
-公证凭据需提前保存到钥匙串：
-
-```bash
-xcrun notarytool store-credentials cutscreen-notary \
-  --apple-id "you@example.com" \
-  --team-id "TEAMID" \
-  --password "APP_SPECIFIC_PASSWORD"
-```
+正式发布所需的签名身份和公证凭据应配置在本机环境或钥匙串中，不要提交到版本库。
 
 ## 使用说明
 
@@ -68,15 +59,8 @@ xcrun notarytool store-credentials cutscreen-notary \
 4. 滚动长截图必须在添加标注前开始。进入后手动向下滚动，点击“完成”或再次按截图快捷键结束。
 5. “确认”复制 PNG，“保存”写入本地，“钉在桌面”创建置顶贴图。
 
-滚动长截图限制为垂直向下，最大高度 50,000 像素、最大总像素 150 MP。动态视频、受保护内容和变化幅度过大的页面可能无法可靠拼接。
+滚动长截图目前仅支持垂直向下。动态视频、受保护内容和变化幅度过大的页面可能无法可靠拼接。
 
-## 架构
+## 隐私说明
 
-- `App`：应用生命周期、菜单栏和入口协调
-- `HotKey` / `Settings`：Carbon 全局快捷键、UserDefaults 和登录项
-- `Capture`：ScreenCaptureKit 静态截图、窗口识别和会话状态机
-- `Editor` / `Rendering`：选区、矢量标注、工具栏和最终合成
-- `Scroll`：8 FPS 区域采集、灰度重叠匹配、磁盘增量条带和内存映射长图
-- `Pin` / `Export`：桌面贴图、PNG/JPEG 和剪贴板
-
-应用空闲时不会保留 `SCStream`，截图和滚动会话结束后会立即释放屏幕帧与临时状态。
+截图和标注均在本机完成。应用不包含账号系统、网络上传或云端存储功能。
