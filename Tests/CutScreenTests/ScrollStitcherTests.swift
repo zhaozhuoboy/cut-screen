@@ -112,6 +112,43 @@ final class ScrollStitcherTests: XCTestCase {
         XCTAssertLessThanOrEqual(abs(stitcher.totalPixelHeight - (height + offsets.last!)), 4)
     }
 
+    func testTinySmoothScrollDoesNotRepeatOverlappingContent() {
+        let width = 240
+        let height = 600
+        let offsets = [0, 2, 4, 7, 10]
+        let stitcher = IncrementalScrollStitcher()
+
+        XCTAssertEqual(
+            stitcher.append(makeTextPageViewport(width: width, height: height, rowOffset: offsets[0])),
+            .firstFrame
+        )
+        for current in offsets.dropFirst() {
+            let result = stitcher.append(makeTextPageViewport(width: width, height: height, rowOffset: current))
+            guard case .appended = result else {
+                return XCTFail("Tiny scroll at offset \(current) should append once, got \(result)")
+            }
+        }
+
+        XCTAssertLessThanOrEqual(abs(stitcher.totalPixelHeight - (height + offsets.last!)), 4)
+    }
+
+    func testDoesNotResumeAgainstStaleFrameAfterRepeatedMatchFailures() {
+        let width = 240
+        let height = 300
+        let stitcher = IncrementalScrollStitcher()
+        let first = makeTextPageViewport(width: width, height: height, rowOffset: 0)
+        let unrelated = makeTextPageViewport(width: width, height: height, rowOffset: 420)
+
+        XCTAssertEqual(stitcher.append(first), .firstFrame)
+        for _ in 0..<IncrementalScrollStitcher.maximumConsecutiveNoMatches {
+            XCTAssertEqual(stitcher.append(unrelated), .noMatch)
+        }
+
+        let staleButMatchable = makeTextPageViewport(width: width, height: height, rowOffset: 18)
+        XCTAssertEqual(stitcher.append(staleButMatchable), .noMatch)
+        XCTAssertEqual(stitcher.totalPixelHeight, height)
+    }
+
     func testLivePreviewAddsOnlyNewlyStitchedStrip() throws {
         let first = makeImage(width: 100, height: 80, rowOffset: 0)
         let second = makeImage(width: 100, height: 80, rowOffset: 20)

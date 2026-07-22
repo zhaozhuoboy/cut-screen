@@ -104,6 +104,7 @@ enum ScrollStitchError: LocalizedError {
 final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
     static let maximumHeight = 50_000
     static let maximumPixels = 150_000_000
+    static let maximumConsecutiveNoMatches = 6
 
     private(set) var totalPixelHeight = 0
     private var previousImage: CGImage?
@@ -113,6 +114,7 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
     private var rawFileURL: URL?
     private var fileHandle: FileHandle?
     private var storageError: (any Error)?
+    private var consecutiveNoMatchCount = 0
 
     deinit {
         try? fileHandle?.close()
@@ -137,13 +139,25 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
         guard image.width == previousImage.width else { return .noMatch }
 
         let currentGray = GrayFrame(image: image)
-        if GrayFrameMatcher.meanDifference(previousGray, currentGray, shift: 0) < 1.2 {
+        let stationaryDifference = GrayFrameMatcher.meanDifference(previousGray, currentGray, shift: 0)
+        if stationaryDifference < 1.2 {
+            consecutiveNoMatchCount = 0
             return .duplicate
         }
 
+        // Once the live viewport has moved too far away from the last accepted
+        // frame, later repeated page sections can look like a valid overlap with
+        // that stale frame. Stop accepting new strips until the user returns to
+        // the last valid viewport instead of corrupting the long screenshot.
+        guard consecutiveNoMatchCount < Self.maximumConsecutiveNoMatches else {
+            return .noMatch
+        }
+
         guard let match = GrayFrameMatcher.bestVerticalShift(previous: previousGray, current: currentGray),
-              match.difference <= 24,
-              match.confidence >= 0.58 else {
+              match.difference <= 20,
+              match.confidence >= 0.66,
+              stationaryDifference - match.difference >= max(0.75, stationaryDifference * 0.08) else {
+            consecutiveNoMatchCount += 1
             return .noMatch
         }
 
@@ -165,6 +179,7 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
         totalPixelHeight = proposedHeight
         self.previousImage = image
         self.previousGray = currentGray
+        consecutiveNoMatchCount = 0
         return .appended(pixelHeight: pixelShift, confidence: match.confidence)
     }
 
@@ -268,10 +283,14 @@ enum GrayFrameMatcher {
               previous.height == current.height,
               previous.height >= 12 else { return nil }
 
-        let minimumShift = max(1, previous.height / 120)
-        // Keep a small but useful overlap even when a trackpad gesture advances
-        // almost a full viewport between two processed frames.
-        let maximumShift = max(minimumShift, Int(Double(previous.height) * 0.95))
+        // Smooth wheel and trackpad scrolling often advances only one or two
+        // downsampled rows between 30 fps frames. Starting at a larger shift
+        // over-appends overlapping content and visibly repeats the first frame.
+        let minimumShift = 1
+        // At 30 fps a legitimate adjacent frame should retain substantial
+        // overlap. A larger jump is more likely a repeated page section matched
+        // against a stale frame, which produces duplicated viewport blocks.
+        let maximumShift = max(minimumShift, Int(Double(previous.height) * 0.40))
         var candidates: [(shift: Int, difference: Double)] = []
 
         for shift in minimumShift...maximumShift {

@@ -16,8 +16,13 @@ enum HotKeyRegistrationError: LocalizedError {
 final class GlobalHotKeyManager {
     var onPressed: (() -> Void)?
 
+    private let identifier: UInt32
     private var hotKeyReference: EventHotKeyRef?
     private var eventHandlerReference: EventHandlerRef?
+
+    init(identifier: UInt32 = 1) {
+        self.identifier = identifier
+    }
 
     func register(_ hotKey: HotKey) throws {
         unregister()
@@ -41,8 +46,10 @@ final class GlobalHotKeyManager {
                     nil,
                     &eventID
                 )
-                guard result == noErr, eventID.id == 1 else { return OSStatus(eventNotHandledErr) }
                 let manager = Unmanaged<GlobalHotKeyManager>.fromOpaque(userData).takeUnretainedValue()
+                guard result == noErr,
+                      eventID.signature == GlobalHotKeyManager.signature,
+                      eventID.id == manager.identifier else { return OSStatus(eventNotHandledErr) }
                 Task { @MainActor in manager.onPressed?() }
                 return noErr
             },
@@ -56,7 +63,7 @@ final class GlobalHotKeyManager {
         }
 
         var reference: EventHotKeyRef?
-        let hotKeyID = EventHotKeyID(signature: Self.signature, id: 1)
+        let hotKeyID = EventHotKeyID(signature: Self.signature, id: identifier)
         let status = RegisterEventHotKey(
             hotKey.keyCode,
             hotKey.carbonModifiers,

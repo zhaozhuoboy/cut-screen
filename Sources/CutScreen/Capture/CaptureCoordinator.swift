@@ -18,6 +18,7 @@ final class CaptureCoordinator {
     private let exporter: any ScreenshotExporting
     private let pasteboard: any PasteboardWriting
     private let pinManager = PinManager()
+    private let escapeHotKeyManager = GlobalHotKeyManager(identifier: 2)
 
     private var overlayControllers: [CaptureOverlayController] = []
     private var activeOverlay: CaptureOverlayController?
@@ -35,6 +36,7 @@ final class CaptureCoordinator {
         captureService = SystemScreenCaptureService(windowDetector: detector)
         exporter = ImageExporter()
         pasteboard = PasteboardService()
+        escapeHotKeyManager.onPressed = { [weak self] in self?.cancel() }
     }
 
     func begin() {
@@ -81,6 +83,7 @@ final class CaptureCoordinator {
         guard state == .scrolling, let session = scrollSession,
               let selection, let activeDisplay, let document else { return }
         state = .exporting
+        escapeHotKeyManager.unregister()
         scrollHUD?.close()
         scrollHUD = nil
         scrollSession = nil
@@ -241,6 +244,7 @@ final class CaptureCoordinator {
         guard state == .editing, let document, !document.hasAnnotations,
               let selection, let activeDisplay else { return }
         state = .scrolling
+        try? escapeHotKeyManager.register(HotKey(keyCode: 53, modifiers: []))
         toolbarController?.hideStylePanel()
         activeOverlay?.beginScrollingMask(selectionRect: selection.localRect)
         toolbarController?.window?.orderOut(nil)
@@ -261,12 +265,15 @@ final class CaptureCoordinator {
         }
         scrollSession = session
         scrollHUD = hud
+        sourceApplication?.activate(options: [.activateIgnoringOtherApps])
         hud.show()
 
         Task {
             do {
+                // Let the source window finish its active/inactive appearance
+                // transition before accepting the first frame as the baseline.
+                try await Task.sleep(nanoseconds: 120_000_000)
                 try await session.start()
-                sourceApplication?.activate(options: [.activateIgnoringOtherApps])
             } catch {
                 restoreEditorAfterScrollFailure(error)
             }
@@ -282,6 +289,7 @@ final class CaptureCoordinator {
     }
 
     private func restoreEditingAfterScroll() {
+        escapeHotKeyManager.unregister()
         scrollHUD?.close()
         scrollHUD = nil
         scrollSession = nil
@@ -355,6 +363,7 @@ final class CaptureCoordinator {
     }
 
     private func finishSession() {
+        escapeHotKeyManager.unregister()
         scrollHUD?.close()
         toolbarController?.close()
         appearanceToolbarController?.close()

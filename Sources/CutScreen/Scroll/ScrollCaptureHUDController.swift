@@ -114,7 +114,12 @@ final class ScrollCaptureHUDController {
 
     func update(result: StitchAppendResult, totalHeight _: Int, preview: CGImage?) {
         if let preview { updatePreviewImage(preview) }
-        if case .limitReached = result {
+        switch result {
+        case .noMatch:
+            borderWindow.contentView?.layer?.borderColor = NSColor.systemOrange.cgColor
+        case .firstFrame, .duplicate, .appended:
+            borderWindow.contentView?.layer?.borderColor = NSColor.systemGreen.cgColor
+        case .limitReached:
             requestFinishOnce()
         }
     }
