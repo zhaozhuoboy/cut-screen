@@ -10,6 +10,19 @@ struct CapturedDisplay {
 
     var pointSize: CGSize { screenFrame.size }
 
+    func localCaptureRegion(at point: CGPoint) -> CGRect {
+        let displayBounds = CGRect(origin: .zero, size: pointSize)
+        for window in windows {
+            let localWindow = window.frame
+                .offsetBy(dx: -screenFrame.minX, dy: -screenFrame.minY)
+                .intersection(displayBounds)
+            if !localWindow.isNull, localWindow.contains(point) {
+                return localWindow
+            }
+        }
+        return displayBounds
+    }
+
     func pixelAlignedLocalRect(_ localRect: CGRect) -> CGRect {
         let clipped = localRect.standardized.intersection(CGRect(origin: .zero, size: pointSize))
         guard clipped.width > 0, clipped.height > 0, scale > 0 else { return .zero }

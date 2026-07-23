@@ -37,6 +37,50 @@ final class CaptureGeometryTests: XCTestCase {
         XCTAssertEqual(aligned, CGRect(x: 0, y: 10, width: 120, height: 70))
     }
 
+    func testCaptureRegionUsesWindowWhenPointerIsInsideIt() throws {
+        let display = CapturedDisplay(
+            displayID: 3,
+            screenFrame: CGRect(x: -200, y: 40, width: 200, height: 150),
+            scale: 1,
+            image: try makeImage(width: 200, height: 150),
+            windows: [
+                DetectedWindow(
+                    windowID: 10,
+                    ownerName: "Example",
+                    frame: CGRect(x: -170, y: 60, width: 100, height: 80),
+                    layer: 0
+                )
+            ]
+        )
+
+        XCTAssertEqual(
+            display.localCaptureRegion(at: CGPoint(x: 50, y: 40)),
+            CGRect(x: 30, y: 20, width: 100, height: 80)
+        )
+    }
+
+    func testCaptureRegionFallsBackToWholeDisplay() throws {
+        let display = CapturedDisplay(
+            displayID: 4,
+            screenFrame: CGRect(x: -200, y: 40, width: 200, height: 150),
+            scale: 1,
+            image: try makeImage(width: 200, height: 150),
+            windows: [
+                DetectedWindow(
+                    windowID: 11,
+                    ownerName: "Example",
+                    frame: CGRect(x: -170, y: 60, width: 100, height: 80),
+                    layer: 0
+                )
+            ]
+        )
+
+        XCTAssertEqual(
+            display.localCaptureRegion(at: CGPoint(x: 170, y: 120)),
+            CGRect(x: 0, y: 0, width: 200, height: 150)
+        )
+    }
+
     private func makeImage(width: Int, height: Int) throws -> CGImage {
         let context = try XCTUnwrap(CGContext(
             data: nil,

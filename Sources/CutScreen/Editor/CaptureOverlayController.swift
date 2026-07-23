@@ -130,6 +130,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         scrollOffsetFromTop = 0
         obscuredPreviewImages.removeAll()
         needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     func beginScrollingMask(selectionRect: CGRect) {
@@ -140,6 +141,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         selectedAnnotationID = nil
         previewAnnotation = nil
         needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     func setTool(_ tool: EditorTool) {
@@ -147,6 +149,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         self.tool = tool
         selectedAnnotationID = nil
         needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     func setStyle(_ style: AnnotationStyle) {
@@ -258,8 +261,42 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     override func mouseMoved(with event: NSEvent) {
         guard mode == .selecting else { return }
         let point = convert(event.locationInWindow, from: nil)
-        hoveredWindowRect = localWindowRect(at: point)
+        hoveredWindowRect = display.localCaptureRegion(at: point)
         needsDisplay = true
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard mode == .editing, let document, let selectionRect else { return }
+
+        if canAdjustSelection(document: document, selectionRect: selectionRect) {
+            for handle in ResizeHandle.allCases {
+                addCursorRect(
+                    handleRect(handle, selection: selectionRect).insetBy(dx: -5, dy: -5),
+                    cursor: resizeCursor(for: handle)
+                )
+            }
+        }
+
+        if let selectedAnnotationID,
+           let annotation = document.annotations.first(where: { $0.id == selectedAnnotationID }),
+           isResizableAnnotation(annotation) {
+            let bounds = annotation.kind.bounds
+            let first = documentToView(bounds.origin)
+            let second = documentToView(CGPoint(x: bounds.maxX, y: bounds.maxY))
+            let viewBounds = CGRect(
+                x: min(first.x, second.x),
+                y: min(first.y, second.y),
+                width: abs(second.x - first.x),
+                height: abs(second.y - first.y)
+            )
+            for handle in ResizeHandle.allCases {
+                addCursorRect(
+                    handleRect(handle, selection: viewBounds).insetBy(dx: -4, dy: -4),
+                    cursor: resizeCursor(for: handle)
+                )
+            }
+        }
     }
 
     private func drawScrollingMask() {
@@ -356,7 +393,9 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         switch interaction {
         case .selecting(let start):
             let dragged = hypot(point.x - start.x, point.y - start.y) >= 4
-            let selected = dragged ? rect(from: start, to: point).intersection(bounds) : (hoveredWindowRect ?? CGRect(x: point.x, y: point.y, width: 1, height: 1))
+            let selected = dragged
+                ? rect(from: start, to: point).intersection(bounds)
+                : (hoveredWindowRect ?? display.localCaptureRegion(at: point))
             guard selected.width >= 4, selected.height >= 4 else {
                 selectionRect = nil
                 return
@@ -634,12 +673,27 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     }
 
     private func beginEditingInteraction(at viewPoint: CGPoint) {
-        guard let document, let selectionRect, selectionRect.contains(viewPoint), let documentPoint = viewToDocument(viewPoint) else { return }
+        guard let document, let selectionRect else { return }
+        let canAdjustSelection = canAdjustSelection(document: document, selectionRect: selectionRect)
+
+        // Selection handles straddle the border, so they must be tested before
+        // requiring the pointer to be inside the selection. They also take
+        // priority over the active drawing tool while no annotation exists.
+        if canAdjustSelection, let handle = selectionHandle(at: viewPoint) {
+            selectedAnnotationID = nil
+            interaction = .resizingSelection(handle: handle, original: selectionRect, start: viewPoint)
+            resizeCursor(for: handle).set()
+            needsDisplay = true
+            return
+        }
+
+        guard selectionRect.contains(viewPoint), let documentPoint = viewToDocument(viewPoint) else { return }
 
         if let selectedAnnotationID,
            let selected = document.annotations.first(where: { $0.id == selectedAnnotationID }),
            let handle = annotationHandle(at: viewPoint, annotation: selected) {
             interaction = .resizingAnnotation(id: selected.id, original: selected, handle: handle, start: documentPoint)
+            resizeCursor(for: handle).set()
             return
         }
 
@@ -648,15 +702,13 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         }) {
             selectedAnnotationID = annotation.id
             interaction = .movingAnnotation(id: annotation.id, original: annotation, start: documentPoint)
+            window?.invalidateCursorRects(for: self)
             needsDisplay = true
             return
         }
 
         if tool == .none {
-            let canAdjustSelection = canAdjustSelection(document: document, selectionRect: selectionRect)
-            if canAdjustSelection, let handle = selectionHandle(at: viewPoint) {
-                interaction = .resizingSelection(handle: handle, original: selectionRect, start: viewPoint)
-            } else if canAdjustSelection {
+            if canAdjustSelection {
                 selectedAnnotationID = nil
                 interaction = .movingSelection(original: selectionRect, start: viewPoint)
             } else {
@@ -926,16 +978,22 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         )
     }
 
-    private func localWindowRect(at point: CGPoint) -> CGRect? {
-        display.windows.first { window in
-            let local = window.frame.offsetBy(dx: -display.screenFrame.minX, dy: -display.screenFrame.minY)
-            return local.contains(point)
-        }.map { $0.frame.offsetBy(dx: -display.screenFrame.minX, dy: -display.screenFrame.minY).intersection(bounds) }
-    }
-
     private func selectionHandle(at point: CGPoint) -> ResizeHandle? {
         guard let selectionRect else { return nil }
-        return ResizeHandle.allCases.first { handleRect($0, selection: selectionRect).insetBy(dx: -3, dy: -3).contains(point) }
+        return ResizeHandle.allCases.first { handleRect($0, selection: selectionRect).insetBy(dx: -5, dy: -5).contains(point) }
+    }
+
+    private func resizeCursor(for handle: ResizeHandle) -> NSCursor {
+        switch handle {
+        case .left, .right:
+            return .resizeLeftRight
+        case .top, .bottom:
+            return .resizeUpDown
+        case .bottomLeft, .topRight:
+            return ResizeHandleCursor.diagonalAscending
+        case .bottomRight, .topLeft:
+            return ResizeHandleCursor.diagonalDescending
+        }
     }
 
     private func annotationHandle(at point: CGPoint, annotation: Annotation) -> ResizeHandle? {
@@ -1056,6 +1114,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     private func notifyDocumentChanged() {
         obscuredPreviewImages.removeAll()
         needsDisplay = true
+        window?.invalidateCursorRects(for: self)
         onDocumentChanged?()
     }
 
@@ -1131,8 +1190,65 @@ private struct MosaicPreviewKey: Hashable {
     let lineWidth: Int
 }
 
+@MainActor
+private enum ResizeHandleCursor {
+    static let diagonalAscending = makeDiagonalCursor(ascending: true)
+    static let diagonalDescending = makeDiagonalCursor(ascending: false)
+
+    private static func makeDiagonalCursor(ascending: Bool) -> NSCursor {
+        let image = NSImage(size: CGSize(width: 24, height: 24), flipped: false) { _ in
+            let path = NSBezierPath()
+            if ascending {
+                path.move(to: CGPoint(x: 5, y: 5))
+                path.line(to: CGPoint(x: 19, y: 19))
+                path.move(to: CGPoint(x: 5, y: 5))
+                path.line(to: CGPoint(x: 5, y: 10))
+                path.move(to: CGPoint(x: 5, y: 5))
+                path.line(to: CGPoint(x: 10, y: 5))
+                path.move(to: CGPoint(x: 19, y: 19))
+                path.line(to: CGPoint(x: 14, y: 19))
+                path.move(to: CGPoint(x: 19, y: 19))
+                path.line(to: CGPoint(x: 19, y: 14))
+            } else {
+                path.move(to: CGPoint(x: 5, y: 19))
+                path.line(to: CGPoint(x: 19, y: 5))
+                path.move(to: CGPoint(x: 5, y: 19))
+                path.line(to: CGPoint(x: 5, y: 14))
+                path.move(to: CGPoint(x: 5, y: 19))
+                path.line(to: CGPoint(x: 10, y: 19))
+                path.move(to: CGPoint(x: 19, y: 5))
+                path.line(to: CGPoint(x: 14, y: 5))
+                path.move(to: CGPoint(x: 19, y: 5))
+                path.line(to: CGPoint(x: 19, y: 10))
+            }
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+            NSColor.white.withAlphaComponent(0.96).setStroke()
+            path.lineWidth = 4
+            path.stroke()
+            NSColor.black.withAlphaComponent(0.92).setStroke()
+            path.lineWidth = 2
+            path.stroke()
+            return true
+        }
+        return NSCursor(image: image, hotSpot: CGPoint(x: 12, y: 12))
+    }
+}
+
 private extension CGRect {
     var pixelAligned: CGRect {
-        CGRect(x: floor(minX) + 0.5, y: floor(minY) + 0.5, width: floor(width), height: floor(height))
+        // Align every edge independently. Deriving the far edge from a rounded
+        // origin plus a rounded size can make a fixed edge jump by one pixel
+        // while the opposite edge is being dragged.
+        let alignedMinX = floor(minX) + 0.5
+        let alignedMinY = floor(minY) + 0.5
+        let alignedMaxX = floor(maxX) + 0.5
+        let alignedMaxY = floor(maxY) + 0.5
+        return CGRect(
+            x: alignedMinX,
+            y: alignedMinY,
+            width: max(0, alignedMaxX - alignedMinX),
+            height: max(0, alignedMaxY - alignedMinY)
+        )
     }
 }
