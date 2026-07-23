@@ -47,11 +47,11 @@ final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @u
         )
         configuration.width = max(1, Int(selection.localRect.width * scale))
         configuration.height = max(1, Int(selection.localRect.height * scale))
-        // Trackpad scrolling can move hundreds of pixels between 12 fps samples.
-        // A 30 fps stream keeps enough overlap for stitching while the queue stays
-        // small enough to avoid retaining a large set of full-resolution frames.
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        configuration.queueDepth = 2
+        // Sampling every display refresh creates many nearly identical frames
+        // during trackpad momentum scrolling. 15 fps still preserves generous
+        // overlap while giving the viewport enough time to move between frames.
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 15)
+        configuration.queueDepth = 1
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.showsCursor = false
         configuration.capturesAudio = false
@@ -115,7 +115,12 @@ final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @u
             break
         }
         let totalHeight = stitcher.totalPixelHeight
-        let preview = previewComposer.update(frame: image, result: result)
+        let preview = previewComposer.update(
+            frame: image,
+            result: result,
+            appendedSourceRect: stitcher.latestAppendedSourceRect,
+            fixedBottomPixelHeight: stitcher.fixedBottomPixelHeight
+        )
         Task { @MainActor [weak self] in self?.onProgress?(result, totalHeight, preview) }
     }
 }

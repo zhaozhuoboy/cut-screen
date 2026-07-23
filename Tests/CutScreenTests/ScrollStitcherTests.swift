@@ -132,6 +132,130 @@ final class ScrollStitcherTests: XCTestCase {
         XCTAssertLessThanOrEqual(abs(stitcher.totalPixelHeight - (height + offsets.last!)), 4)
     }
 
+    func testDetectsStationarySpreadsheetFooter() {
+        let width = 360
+        let height = 420
+        let footerHeight = 44
+        let first = GrayFrame(image: makeSpreadsheetViewport(
+            width: width,
+            height: height,
+            rowOffset: 0,
+            footerHeight: footerHeight
+        ))
+        let second = GrayFrame(image: makeSpreadsheetViewport(
+            width: width,
+            height: height,
+            rowOffset: 18,
+            footerHeight: footerHeight
+        ))
+
+        let inset = GrayFrameMatcher.stationaryBottomInset(previous: first, current: second)
+        let expected = Int((Double(footerHeight) * Double(first.height) / Double(height)).rounded())
+        XCTAssertLessThanOrEqual(abs(inset - expected), 3)
+    }
+
+    func testTrackpadSpreadsheetFramesKeepFixedFooterOnlyOnce() throws {
+        let width = 360
+        let height = 420
+        let footerHeight = 44
+        let offsets = [0, 3, 8, 16, 29, 47, 70]
+        let stitcher = IncrementalScrollStitcher()
+
+        XCTAssertEqual(
+            stitcher.append(makeSpreadsheetViewport(
+                width: width,
+                height: height,
+                rowOffset: offsets[0],
+                footerHeight: footerHeight
+            )),
+            .firstFrame
+        )
+        var appendedCount = 0
+        for current in offsets.dropFirst() {
+            let result = stitcher.append(makeSpreadsheetViewport(
+                width: width,
+                height: height,
+                rowOffset: current,
+                footerHeight: footerHeight
+            ))
+            switch result {
+            case .appended:
+                appendedCount += 1
+            case .duplicate, .noMatch:
+                // Sub-pixel/tiny movements are intentionally held until a
+                // later trackpad frame has accumulated enough displacement.
+                continue
+            default:
+                return XCTFail("Unexpected trackpad result at offset \(current): \(result)")
+            }
+        }
+
+        XCTAssertGreaterThan(appendedCount, 0)
+        XCTAssertLessThanOrEqual(abs(stitcher.fixedBottomPixelHeight - footerHeight), 6)
+        let result = try stitcher.finalize()
+        XCTAssertLessThanOrEqual(abs(result.height - (height + offsets.last!)), 5)
+
+        let expected = makeSpreadsheetLongImage(
+            width: width,
+            viewportHeight: height,
+            extraRows: offsets.last!,
+            footerHeight: footerHeight
+        )
+        let comparisonHeight = min(result.height, expected.height)
+        let resultComparison = try XCTUnwrap(result.cropping(to: CGRect(
+            x: 0,
+            y: 0,
+            width: result.width,
+            height: comparisonHeight
+        )))
+        let expectedComparison = try XCTUnwrap(expected.cropping(to: CGRect(
+            x: 0,
+            y: 0,
+            width: expected.width,
+            height: comparisonHeight
+        )))
+        let resultGray = GrayFrame(image: resultComparison, targetWidth: 96, maximumHeight: comparisonHeight)
+        let expectedGray = GrayFrame(image: expectedComparison, targetWidth: 96, maximumHeight: comparisonHeight)
+        XCTAssertLessThan(GrayFrameMatcher.meanDifference(expectedGray, resultGray, shift: 0), 25)
+    }
+
+    func testLivePreviewTrimsFixedFooterBeforeAppendingTrackpadStrip() throws {
+        let width = 360
+        let height = 420
+        let footerHeight = 44
+        let shift = 20
+        let first = makeSpreadsheetViewport(
+            width: width,
+            height: height,
+            rowOffset: 0,
+            footerHeight: footerHeight
+        )
+        let second = makeSpreadsheetViewport(
+            width: width,
+            height: height,
+            rowOffset: shift,
+            footerHeight: footerHeight
+        )
+        let composer = ScrollPreviewComposer(maximumWidth: 180)
+
+        let initial = try XCTUnwrap(composer.update(frame: first, result: .firstFrame))
+        XCTAssertEqual(initial.height, 210)
+
+        let sourceRect = CGRect(
+            x: 0,
+            y: height - footerHeight - shift,
+            width: width,
+            height: shift
+        )
+        let preview = try XCTUnwrap(composer.update(
+            frame: second,
+            result: .appended(pixelHeight: shift, confidence: 0.9),
+            appendedSourceRect: sourceRect,
+            fixedBottomPixelHeight: footerHeight
+        ))
+        XCTAssertEqual(preview.height, 198)
+    }
+
     func testDoesNotResumeAgainstStaleFrameAfterRepeatedMatchFailures() {
         let width = 240
         let height = 300
@@ -232,6 +356,101 @@ final class ScrollStitcherTests: XCTestCase {
                     }
                 }
 
+                bytes[offset] = value
+                bytes[offset + 1] = value
+                bytes[offset + 2] = value
+                bytes[offset + 3] = 255
+            }
+        }
+
+        let provider = CGDataProvider(data: Data(bytes) as CFData)!
+        return CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).union(.byteOrder32Big),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )!
+    }
+
+    private func makeSpreadsheetViewport(
+        width: Int,
+        height: Int,
+        rowOffset: Int,
+        footerHeight: Int
+    ) -> CGImage {
+        makeSpreadsheetImage(
+            width: width,
+            height: height,
+            headerHeight: 96,
+            footerHeight: footerHeight,
+            contentRowOffset: rowOffset
+        )
+    }
+
+    private func makeSpreadsheetLongImage(
+        width: Int,
+        viewportHeight: Int,
+        extraRows: Int,
+        footerHeight: Int
+    ) -> CGImage {
+        makeSpreadsheetImage(
+            width: width,
+            height: viewportHeight + extraRows,
+            headerHeight: 96,
+            footerHeight: footerHeight,
+            contentRowOffset: 0
+        )
+    }
+
+    private func makeSpreadsheetImage(
+        width: Int,
+        height: Int,
+        headerHeight: Int,
+        footerHeight: Int,
+        contentRowOffset: Int
+    ) -> CGImage {
+        var bytes = [UInt8](repeating: 255, count: width * height * 4)
+        for row in 0..<height {
+            for column in 0..<width {
+                let offset = (row * width + column) * 4
+                let value: UInt8
+                if row < headerHeight {
+                    value = row % 24 < 2 || column % 72 < 2 ? 176 : 232
+                } else if row >= height - footerHeight {
+                    let footerRow = row - (height - footerHeight)
+                    if footerRow < 2 {
+                        value = 156
+                    } else if footerRow % 16 < 2 || column % 58 < 2 {
+                        value = 188
+                    } else {
+                        value = 238
+                    }
+                } else if column >= width - 14 {
+                    value = row % 30 < 8 ? 178 : 226
+                } else {
+                    let pageRow = row - headerHeight + contentRowOffset
+                    let rowNumber = pageRow / 22
+                    let rowInCell = pageRow % 22
+                    var hash = UInt32(truncatingIfNeeded: rowNumber) &* 2_654_435_761
+                    hash ^= hash >> 13
+                    hash &*= 1_103_515_245
+                    if rowInCell == 0 || column % 54 == 0 {
+                        value = 202
+                    } else if (6...9).contains(rowInCell),
+                              column > 18,
+                              column < 80 + Int(hash % UInt32(max(1, width - 110))) {
+                        value = UInt8(52 + Int(hash % 80))
+                    } else {
+                        value = 248
+                    }
+                }
                 bytes[offset] = value
                 bytes[offset + 1] = value
                 bytes[offset + 2] = value

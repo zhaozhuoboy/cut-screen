@@ -10,6 +10,8 @@ enum StitchAppendResult: Equatable {
 
 protocol ScrollStitching: AnyObject {
     var totalPixelHeight: Int { get }
+    var fixedBottomPixelHeight: Int { get }
+    var latestAppendedSourceRect: CGRect? { get }
     func append(_ image: CGImage) -> StitchAppendResult
     func finalize() throws -> CGImage
 }
@@ -20,26 +22,41 @@ protocol ScrollStitching: AnyObject {
 final class ScrollPreviewComposer {
     private let maximumWidth: Int
     private var strips: [CGImage] = []
+    private var appliedBottomInset = 0
     private(set) var image: CGImage?
 
     init(maximumWidth: Int = 220) {
         self.maximumWidth = max(1, maximumWidth)
     }
 
-    func update(frame: CGImage, result: StitchAppendResult) -> CGImage? {
+    func update(
+        frame: CGImage,
+        result: StitchAppendResult,
+        appendedSourceRect: CGRect? = nil,
+        fixedBottomPixelHeight: Int = 0
+    ) -> CGImage? {
+        trimInitialFooterIfNeeded(
+            sourceWidth: frame.width,
+            fixedBottomPixelHeight: fixedBottomPixelHeight
+        )
         let source: CGImage?
         switch result {
         case .firstFrame:
             strips.removeAll(keepingCapacity: true)
+            appliedBottomInset = 0
             source = frame
         case .appended(let pixelHeight, _):
-            let height = min(max(1, pixelHeight), frame.height)
-            source = frame.cropping(to: CGRect(
-                x: 0,
-                y: frame.height - height,
-                width: frame.width,
-                height: height
-            ))
+            if let appendedSourceRect {
+                source = frame.cropping(to: appendedSourceRect)
+            } else {
+                let height = min(max(1, pixelHeight), frame.height)
+                source = frame.cropping(to: CGRect(
+                    x: 0,
+                    y: frame.height - height,
+                    width: frame.width,
+                    height: height
+                ))
+            }
         case .duplicate, .noMatch, .limitReached:
             return image
         }
@@ -48,6 +65,22 @@ final class ScrollPreviewComposer {
         strips.append(strip)
         image = composeStrips()
         return image
+    }
+
+    private func trimInitialFooterIfNeeded(sourceWidth: Int, fixedBottomPixelHeight: Int) {
+        guard fixedBottomPixelHeight > appliedBottomInset,
+              let first = strips.first,
+              sourceWidth > 0 else { return }
+        let additionalPixels = fixedBottomPixelHeight - appliedBottomInset
+        let scaledTrim = max(1, Int((CGFloat(additionalPixels) * CGFloat(first.width) / CGFloat(sourceWidth)).rounded()))
+        let retainedHeight = first.height - scaledTrim
+        guard retainedHeight > 0,
+              let trimmed = first.cropping(to: CGRect(x: 0, y: 0, width: first.width, height: retainedHeight)) else {
+            return
+        }
+        strips[0] = trimmed
+        appliedBottomInset = fixedBottomPixelHeight
+        image = composeStrips()
     }
 
     private func downsample(_ source: CGImage) -> CGImage? {
@@ -107,14 +140,18 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
     static let maximumConsecutiveNoMatches = 6
 
     private(set) var totalPixelHeight = 0
+    private(set) var fixedBottomPixelHeight = 0
+    private(set) var latestAppendedSourceRect: CGRect?
     private var previousImage: CGImage?
     private var previousGray: GrayFrame?
+    private var latestFooterImage: CGImage?
     private var pixelWidth = 0
     private var sessionDirectory: URL?
     private var rawFileURL: URL?
     private var fileHandle: FileHandle?
     private var storageError: (any Error)?
     private var consecutiveNoMatchCount = 0
+    private var acceptedAppendCount = 0
 
     deinit {
         try? fileHandle?.close()
@@ -134,6 +171,7 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
             self.previousGray = GrayFrame(image: image)
             pixelWidth = image.width
             totalPixelHeight = image.height
+            latestAppendedSourceRect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
             return .firstFrame
         }
         guard image.width == previousImage.width else { return .noMatch }
@@ -142,14 +180,46 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
         let stationaryDifference = GrayFrameMatcher.meanDifference(previousGray, currentGray, shift: 0)
         if stationaryDifference < 1.2 {
             consecutiveNoMatchCount = 0
+            latestAppendedSourceRect = nil
             return .duplicate
         }
+
+        if fixedBottomPixelHeight == 0, acceptedAppendCount == 0 {
+            let previousEdgeGray = GrayFrame(
+                image: previousImage,
+                targetWidth: 96,
+                maximumHeight: min(720, previousImage.height)
+            )
+            let currentEdgeGray = GrayFrame(
+                image: image,
+                targetWidth: 96,
+                maximumHeight: min(720, image.height)
+            )
+            let grayInset = GrayFrameMatcher.stationaryBottomInset(
+                previous: previousEdgeGray,
+                current: currentEdgeGray
+            )
+            let detectedInset = Int(
+                (Double(grayInset) / Double(max(1, currentEdgeGray.height)) * Double(image.height)).rounded()
+            )
+            if detectedInset >= 12, detectedInset <= image.height / 4 {
+                do {
+                    try removeStoredBottom(pixelHeight: detectedInset)
+                    fixedBottomPixelHeight = detectedInset
+                } catch {
+                    storageError = error
+                    return .noMatch
+                }
+            }
+        }
+        updateLatestFooter(from: image)
 
         // Once the live viewport has moved too far away from the last accepted
         // frame, later repeated page sections can look like a valid overlap with
         // that stale frame. Stop accepting new strips until the user returns to
         // the last valid viewport instead of corrupting the long screenshot.
         guard consecutiveNoMatchCount < Self.maximumConsecutiveNoMatches else {
+            latestAppendedSourceRect = nil
             return .noMatch
         }
 
@@ -158,17 +228,30 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
               match.confidence >= 0.66,
               stationaryDifference - match.difference >= max(0.75, stationaryDifference * 0.08) else {
             consecutiveNoMatchCount += 1
+            latestAppendedSourceRect = nil
             return .noMatch
         }
 
         let pixelShift = max(1, Int((Double(match.shift) / Double(currentGray.height)) * Double(image.height)))
         let proposedHeight = totalPixelHeight + pixelShift
-        guard proposedHeight <= Self.maximumHeight,
-              proposedHeight * image.width <= Self.maximumPixels else {
+        let finalHeight = proposedHeight + fixedBottomPixelHeight
+        guard finalHeight <= Self.maximumHeight,
+              finalHeight * image.width <= Self.maximumPixels else {
+            latestAppendedSourceRect = nil
             return .limitReached
         }
 
-        let cropRect = CGRect(x: 0, y: image.height - pixelShift, width: image.width, height: pixelShift)
+        let scrollingBottom = image.height - fixedBottomPixelHeight
+        guard pixelShift <= scrollingBottom else {
+            latestAppendedSourceRect = nil
+            return .noMatch
+        }
+        let cropRect = CGRect(
+            x: 0,
+            y: scrollingBottom - pixelShift,
+            width: image.width,
+            height: pixelShift
+        )
         guard let strip = image.cropping(to: cropRect) else { return .noMatch }
         do {
             try appendPixels(from: strip)
@@ -180,12 +263,19 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
         self.previousImage = image
         self.previousGray = currentGray
         consecutiveNoMatchCount = 0
+        acceptedAppendCount += 1
+        latestAppendedSourceRect = cropRect
         return .appended(pixelHeight: pixelShift, confidence: match.confidence)
     }
 
     func finalize() throws -> CGImage {
         if let storageError { throw storageError }
         guard totalPixelHeight > 0, pixelWidth > 0, let rawFileURL else { throw ScrollStitchError.noFrames }
+        if let latestFooterImage, fixedBottomPixelHeight > 0 {
+            try appendPixels(from: latestFooterImage)
+            totalPixelHeight += latestFooterImage.height
+            self.latestFooterImage = nil
+        }
         try fileHandle?.close()
         fileHandle = nil
 
@@ -233,6 +323,34 @@ final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
         ) else { throw ScrollStitchError.imageCreation }
         context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         try fileHandle.write(contentsOf: Data(bytes))
+    }
+
+    private func removeStoredBottom(pixelHeight: Int) throws {
+        guard pixelHeight > 0,
+              pixelHeight < totalPixelHeight,
+              let fileHandle,
+              let previousImage,
+              let retained = previousImage.cropping(to: CGRect(
+                x: 0,
+                y: 0,
+                width: previousImage.width,
+                height: previousImage.height - pixelHeight
+              )) else { return }
+        try fileHandle.truncate(atOffset: 0)
+        try fileHandle.seek(toOffset: 0)
+        totalPixelHeight = 0
+        try appendPixels(from: retained)
+        totalPixelHeight = retained.height
+    }
+
+    private func updateLatestFooter(from image: CGImage) {
+        guard fixedBottomPixelHeight > 0 else { return }
+        latestFooterImage = image.cropping(to: CGRect(
+            x: 0,
+            y: image.height - fixedBottomPixelHeight,
+            width: image.width,
+            height: fixedBottomPixelHeight
+        ))
     }
 }
 
@@ -315,6 +433,41 @@ enum GrayFrameMatcher {
         return Match(shift: best.shift, confidence: confidence, difference: best.difference)
     }
 
+    static func stationaryBottomInset(previous: GrayFrame, current: GrayFrame) -> Int {
+        guard previous.width == current.width,
+              previous.height == current.height,
+              previous.width >= 8,
+              previous.height >= 40 else { return 0 }
+
+        let maximumRows = max(1, previous.height / 4)
+        let minimumRows = max(10, previous.height / 36)
+        let startColumn = previous.width / 20
+        let endColumn = max(startColumn + 1, previous.width - previous.width / 12)
+        var stableRows = 0
+
+        for row in stride(
+            from: previous.height - 1,
+            through: previous.height - maximumRows,
+            by: -1
+        ) {
+            var squaredTotal: Int64 = 0
+            var count: Int64 = 0
+            let offset = row * previous.width
+            for column in startColumn..<endColumn {
+                let difference = Int64(
+                    Int(previous.pixels[offset + column]) - Int(current.pixels[offset + column])
+                )
+                squaredTotal += difference * difference
+                count += 1
+            }
+            let rowDifference = count > 0 ? sqrt(Double(squaredTotal) / Double(count)) : 255
+            guard rowDifference <= 2.2 else { break }
+            stableRows += 1
+        }
+
+        return stableRows >= minimumRows ? stableRows : 0
+    }
+
     static func meanDifference(_ previous: GrayFrame, _ current: GrayFrame, shift: Int) -> Double {
         guard previous.width == current.width, previous.height == current.height else { return 255 }
         let overlap = previous.height - shift
@@ -322,8 +475,8 @@ enum GrayFrameMatcher {
 
         // Ignore common sticky headers/footers and page sidebars. RMS difference
         // keeps sparse text edges meaningful on otherwise white pages.
-        let startRow = min(max(0, min(current.height / 6, overlap / 4)), overlap - 1)
-        let endRow = max(startRow + 1, overlap - max(1, min(current.height / 12, overlap / 5)))
+        let startRow = min(max(0, min(current.height / 4, overlap / 3)), overlap - 1)
+        let endRow = max(startRow + 1, overlap - max(1, min(current.height / 8, overlap / 5)))
         let startColumn = current.width / 10
         let endColumn = max(startColumn + 1, current.width - current.width / 10)
         var squaredTotal: Int64 = 0
