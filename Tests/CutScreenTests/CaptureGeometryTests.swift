@@ -81,6 +81,20 @@ final class CaptureGeometryTests: XCTestCase {
         )
     }
 
+    func testPixelColorUsesCapturedImageAndFormatsHexValue() throws {
+        let display = CapturedDisplay(
+            displayID: 5,
+            screenFrame: CGRect(x: 0, y: 0, width: 1, height: 1),
+            scale: 2,
+            image: try makeSolidImage(width: 2, height: 2, rgba: [0x12, 0x34, 0x56, 0xFF]),
+            windows: []
+        )
+
+        let color = try XCTUnwrap(display.pixelColor(at: CGPoint(x: 0.75, y: 0.25)))
+        XCTAssertEqual(color, CapturedPixelColor(red: 0x12, green: 0x34, blue: 0x56))
+        XCTAssertEqual(color.hexString, "#123456")
+    }
+
     private func makeImage(width: Int, height: Int) throws -> CGImage {
         let context = try XCTUnwrap(CGContext(
             data: nil,
@@ -92,5 +106,25 @@ final class CaptureGeometryTests: XCTestCase {
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ))
         return try XCTUnwrap(context.makeImage())
+    }
+
+    private func makeSolidImage(width: Int, height: Int, rgba: [UInt8]) throws -> CGImage {
+        let data = Data(Array(repeating: rgba, count: width * height).flatMap { $0 })
+        let provider = try XCTUnwrap(CGDataProvider(data: data as CFData))
+        return try XCTUnwrap(CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.union(
+                CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+            ),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ))
     }
 }

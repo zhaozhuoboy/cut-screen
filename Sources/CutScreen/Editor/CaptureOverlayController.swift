@@ -106,6 +106,10 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     private var textAnnotationField: NSTextField?
     private var editingTextAnnotationID: UUID?
     private var selectionAdjustmentIsActive = false
+    private var precisionPoint: CGPoint?
+    private var precisionColor: CapturedPixelColor?
+    private var copiedColorHex: String?
+    private var precisionTrackingArea: NSTrackingArea?
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     init(display: CapturedDisplay) {
@@ -117,6 +121,21 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     required init?(coder: NSCoder) { nil }
     override var acceptsFirstResponder: Bool { true }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let precisionTrackingArea {
+            removeTrackingArea(precisionTrackingArea)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved, .enabledDuringMouseDrag],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        precisionTrackingArea = trackingArea
+    }
+
     var currentSelectionRect: CGRect? { selectionRect }
     var currentDocument: CaptureDocument? { document }
 
@@ -127,6 +146,9 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         mode = .editing
         interaction = .none
         hoveredWindowRect = nil
+        precisionPoint = nil
+        precisionColor = nil
+        copiedColorHex = nil
         scrollOffsetFromTop = 0
         obscuredPreviewImages.removeAll()
         needsDisplay = true
@@ -140,6 +162,9 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         interaction = .none
         selectedAnnotationID = nil
         previewAnnotation = nil
+        precisionPoint = nil
+        precisionColor = nil
+        copiedColorHex = nil
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
     }
@@ -212,6 +237,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         let focusRect = selectionRect ?? hoveredWindowRect
         guard let focusRect else {
             drawHint("拖拽选择区域，或单击选中窗口")
+            drawPrecisionLoupeIfNeeded()
             return
         }
 
@@ -256,17 +282,37 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
             drawSizeLabel(for: focusRect)
             drawSelectionHandles(for: focusRect)
         }
+        drawPrecisionLoupeIfNeeded()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard mode == .selecting else { return }
+        updatePrecisionSelection(at: convert(event.locationInWindow, from: nil))
     }
 
     override func mouseMoved(with event: NSEvent) {
         guard mode == .selecting else { return }
         let point = convert(event.locationInWindow, from: nil)
-        hoveredWindowRect = display.localCaptureRegion(at: point)
+        updatePrecisionSelection(at: point)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard shouldShowPrecisionLoupe else { return }
+        precisionPoint = nil
+        precisionColor = nil
+        copiedColorHex = nil
+        if mode == .selecting {
+            hoveredWindowRect = nil
+        }
         needsDisplay = true
     }
 
     override func resetCursorRects() {
         super.resetCursorRects()
+        if mode == .selecting {
+            addCursorRect(bounds, cursor: .crosshair)
+            return
+        }
         guard mode == .editing, let document, let selectionRect else { return }
 
         if canAdjustSelection(document: document, selectionRect: selectionRect) {
@@ -342,6 +388,9 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
 
     override func mouseDragged(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if mode == .selecting {
+            updatePrecisionPoint(at: point)
+        }
         switch interaction {
         case .selecting(let start):
             selectionRect = rect(from: start, to: point).intersection(bounds)
@@ -374,6 +423,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
             selectionRect = moved
         case .resizingSelection(let handle, let original, let start):
             setSelectionAdjustmentActive(true)
+            updatePrecisionPoint(at: point)
             selectionRect = resizedSelection(original, handle: handle, delta: CGPoint(x: point.x - start.x, y: point.y - start.y))
         case .none:
             break
@@ -387,6 +437,11 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
             setSelectionAdjustmentActive(false)
             interaction = .none
             previewAnnotation = nil
+            if mode == .editing {
+                precisionPoint = nil
+                precisionColor = nil
+                copiedColorHex = nil
+            }
             needsDisplay = true
         }
 
@@ -447,6 +502,12 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 {
             onCancel?()
+            return
+        }
+        if mode == .selecting,
+           event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "c" {
+            copyCurrentColor()
             return
         }
         if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "z" {
@@ -682,6 +743,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         if canAdjustSelection, let handle = selectionHandle(at: viewPoint) {
             selectedAnnotationID = nil
             interaction = .resizingSelection(handle: handle, original: selectionRect, start: viewPoint)
+            updatePrecisionPoint(at: viewPoint)
             resizeCursor(for: handle).set()
             needsDisplay = true
             return
@@ -1090,6 +1152,199 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         return CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)
     }
 
+    private func updatePrecisionSelection(at point: CGPoint) {
+        guard bounds.contains(point) else {
+            precisionPoint = nil
+            precisionColor = nil
+            copiedColorHex = nil
+            hoveredWindowRect = nil
+            needsDisplay = true
+            return
+        }
+        if window?.isKeyWindow == false {
+            window?.makeKey()
+        }
+        window?.makeFirstResponder(self)
+        hoveredWindowRect = display.localCaptureRegion(at: point)
+        updatePrecisionPoint(at: point)
+    }
+
+    private func updatePrecisionPoint(at point: CGPoint) {
+        let clampedPoint = CGPoint(
+            x: min(max(point.x, bounds.minX), bounds.maxX),
+            y: min(max(point.y, bounds.minY), bounds.maxY)
+        )
+        let color = display.pixelColor(at: clampedPoint)
+        if copiedColorHex != color?.hexString {
+            copiedColorHex = nil
+        }
+        precisionPoint = clampedPoint
+        precisionColor = color
+        needsDisplay = true
+    }
+
+    private func copyCurrentColor() {
+        guard let color = precisionColor else { return }
+        if PasteboardService().writeString(color.hexString) {
+            copiedColorHex = color.hexString
+            needsDisplay = true
+        }
+    }
+
+    private func drawPrecisionLoupeIfNeeded() {
+        guard shouldShowPrecisionLoupe,
+              let point = precisionPoint,
+              let color = precisionColor else { return }
+
+        let cardSize = CGSize(width: 132, height: 110)
+        let cardFrame = precisionLoupeFrame(near: point, size: cardSize)
+        let cardPath = NSBezierPath(roundedRect: cardFrame, xRadius: 10, yRadius: 10)
+
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.34)
+        shadow.shadowBlurRadius = 12
+        shadow.shadowOffset = CGSize(width: 0, height: -3)
+        shadow.set()
+        NSColor(calibratedWhite: 0.98, alpha: 0.97).setFill()
+        cardPath.fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSColor.systemGreen.withAlphaComponent(0.88).setStroke()
+        cardPath.lineWidth = 1.5
+        cardPath.stroke()
+
+        let imageRect = CGRect(
+            x: cardFrame.minX + 6,
+            y: cardFrame.minY + 32,
+            width: 120,
+            height: 72
+        )
+        let sample = precisionSampleGeometry(around: point)
+        let imagePath = NSBezierPath(roundedRect: imageRect, xRadius: 6, yRadius: 6)
+
+        NSGraphicsContext.saveGraphicsState()
+        imagePath.addClip()
+        fullImage.draw(
+            in: imageRect,
+            from: sample.sourceRect,
+            operation: .copy,
+            fraction: 1,
+            respectFlipped: false,
+            hints: [.interpolation: NSImageInterpolation.none]
+        )
+        drawPrecisionGrid(in: imageRect, sample: sample)
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSColor.black.withAlphaComponent(0.22).setStroke()
+        imagePath.lineWidth = 0.75
+        imagePath.stroke()
+
+        let swatch = CGRect(x: cardFrame.minX + 9, y: cardFrame.minY + 9, width: 14, height: 14)
+        color.nsColor.setFill()
+        NSBezierPath(roundedRect: swatch, xRadius: 3, yRadius: 3).fill()
+        NSColor.black.withAlphaComponent(0.22).setStroke()
+        let swatchBorder = NSBezierPath(roundedRect: swatch, xRadius: 3, yRadius: 3)
+        swatchBorder.lineWidth = 0.75
+        swatchBorder.stroke()
+
+        let hexAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.black.withAlphaComponent(0.84)
+        ]
+        color.hexString.draw(
+            at: CGPoint(x: swatch.maxX + 6, y: cardFrame.minY + 8),
+            withAttributes: hexAttributes
+        )
+
+        let action = copiedColorHex == color.hexString ? "已复制" : "⌘C"
+        let actionAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
+            .foregroundColor: copiedColorHex == color.hexString
+                ? NSColor.systemGreen
+                : NSColor.black.withAlphaComponent(0.48)
+        ]
+        let actionSize = action.size(withAttributes: actionAttributes)
+        action.draw(
+            at: CGPoint(x: cardFrame.maxX - actionSize.width - 9, y: cardFrame.minY + 9),
+            withAttributes: actionAttributes
+        )
+    }
+
+    private func precisionLoupeFrame(near point: CGPoint, size: CGSize) -> CGRect {
+        let margin: CGFloat = 10
+        let pointerGap: CGFloat = 20
+        var x = point.x + pointerGap
+        var y = point.y - size.height - pointerGap
+        if x + size.width > bounds.maxX - margin {
+            x = point.x - size.width - pointerGap
+        }
+        if y < bounds.minY + margin {
+            y = point.y + pointerGap
+        }
+        x = min(max(bounds.minX + margin, x), max(bounds.minX + margin, bounds.maxX - size.width - margin))
+        y = min(max(bounds.minY + margin, y), max(bounds.minY + margin, bounds.maxY - size.height - margin))
+        return CGRect(origin: CGPoint(x: x, y: y), size: size)
+    }
+
+    private func precisionSampleGeometry(around point: CGPoint) -> PrecisionSampleGeometry {
+        let columns = min(15, max(1, display.image.width))
+        let rows = min(9, max(1, display.image.height))
+        let scale = max(display.scale, 0.001)
+        let pixelX = min(max(0, Int(floor(point.x * scale))), display.image.width - 1)
+        let pixelY = min(max(0, Int(floor(point.y * scale))), display.image.height - 1)
+        let minimumPixelX = min(max(0, pixelX - columns / 2), display.image.width - columns)
+        let minimumPixelY = min(max(0, pixelY - rows / 2), display.image.height - rows)
+        return PrecisionSampleGeometry(
+            sourceRect: CGRect(
+                x: CGFloat(minimumPixelX) / scale,
+                y: CGFloat(minimumPixelY) / scale,
+                width: CGFloat(columns) / scale,
+                height: CGFloat(rows) / scale
+            ),
+            columns: columns,
+            rows: rows,
+            selectedColumn: pixelX - minimumPixelX,
+            selectedRow: pixelY - minimumPixelY
+        )
+    }
+
+    private func drawPrecisionGrid(in rect: CGRect, sample: PrecisionSampleGeometry) {
+        let columnWidth = rect.width / CGFloat(sample.columns)
+        let rowHeight = rect.height / CGFloat(sample.rows)
+        let grid = NSBezierPath()
+        for column in 1..<sample.columns {
+            let x = rect.minX + CGFloat(column) * columnWidth
+            grid.move(to: CGPoint(x: x, y: rect.minY))
+            grid.line(to: CGPoint(x: x, y: rect.maxY))
+        }
+        for row in 1..<sample.rows {
+            let y = rect.minY + CGFloat(row) * rowHeight
+            grid.move(to: CGPoint(x: rect.minX, y: y))
+            grid.line(to: CGPoint(x: rect.maxX, y: y))
+        }
+        NSColor.black.withAlphaComponent(0.13).setStroke()
+        grid.lineWidth = 0.5
+        grid.stroke()
+
+        let center = CGPoint(
+            x: rect.minX + (CGFloat(sample.selectedColumn) + 0.5) * columnWidth,
+            y: rect.minY + (CGFloat(sample.selectedRow) + 0.5) * rowHeight
+        )
+        let marker = NSBezierPath()
+        marker.move(to: CGPoint(x: rect.minX, y: center.y))
+        marker.line(to: CGPoint(x: rect.maxX, y: center.y))
+        marker.move(to: CGPoint(x: center.x, y: rect.minY))
+        marker.line(to: CGPoint(x: center.x, y: rect.maxY))
+        marker.lineCapStyle = .square
+        NSColor.white.withAlphaComponent(0.82).setStroke()
+        marker.lineWidth = 1.5
+        marker.stroke()
+        NSColor.systemGreen.setStroke()
+        marker.lineWidth = 0.75
+        marker.stroke()
+    }
+
     private func drawHint(_ text: String) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 14, weight: .medium),
@@ -1139,6 +1394,12 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private var shouldShowPrecisionLoupe: Bool {
+        if mode == .selecting { return true }
+        if case .resizingSelection = interaction { return true }
+        return false
+    }
+
     private func setSelectionAdjustmentActive(_ active: Bool) {
         guard selectionAdjustmentIsActive != active else { return }
         selectionAdjustmentIsActive = active
@@ -1183,6 +1444,14 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
             width: abs(second.x - first.x), height: abs(second.y - first.y)
         )
     }
+}
+
+private struct PrecisionSampleGeometry {
+    let sourceRect: CGRect
+    let columns: Int
+    let rows: Int
+    let selectedColumn: Int
+    let selectedRow: Int
 }
 
 private struct MosaicPreviewKey: Hashable {
