@@ -52,6 +52,9 @@ swift test
 make dmg
 ```
 
+生成的 DMG 使用拖拽安装布局：打开后将 `CutScreen.app` 拖到右侧的
+`Applications` 文件夹即可完成安装。
+
 正式发布所需的签名身份和公证凭据应配置在本机环境或钥匙串中，不要提交到版本库。
 
 ### 从 GitHub Actions 手动发布
