@@ -7,6 +7,8 @@ final class StatusBarController: NSObject {
     private let onQuit: () -> Void
     private var statusItem: NSStatusItem?
     private var captureItem: NSMenuItem?
+    private var launchHintPopover: NSPopover?
+    private var launchHintTask: Task<Void, Never>?
 
     init(onCapture: @escaping () -> Void, onSettings: @escaping () -> Void, onQuit: @escaping () -> Void) {
         self.onCapture = onCapture
@@ -52,6 +54,40 @@ final class StatusBarController: NSObject {
         captureItem?.title = "开始截图（\(shortcut)）"
     }
 
+    func showLaunchHint(shortcut: String) {
+        dismissLaunchHint()
+        launchHintTask = Task { @MainActor [weak self] in
+            try? await Task<Never, Never>.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled, let self, let button = statusItem?.button else { return }
+
+            let content = LaunchHintViewController(shortcut: shortcut) { [weak self] in
+                self?.dismissLaunchHint()
+                self?.onCapture()
+            }
+            let popover = NSPopover()
+            popover.behavior = .transient
+            popover.animates = true
+            popover.contentSize = CGSize(width: 300, height: 132)
+            popover.contentViewController = content
+            launchHintPopover = popover
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+
+            try? await Task<Never, Never>.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled else { return }
+            popover.performClose(nil)
+            if launchHintPopover === popover {
+                launchHintPopover = nil
+            }
+        }
+    }
+
+    func dismissLaunchHint() {
+        launchHintTask?.cancel()
+        launchHintTask = nil
+        launchHintPopover?.performClose(nil)
+        launchHintPopover = nil
+    }
+
     func showError(_ message: String?) {
         guard let message else { return }
         let alert = NSAlert()
@@ -61,7 +97,10 @@ final class StatusBarController: NSObject {
         alert.runModal()
     }
 
-    @objc private func capture() { onCapture() }
+    @objc private func capture() {
+        dismissLaunchHint()
+        onCapture()
+    }
     @objc private func settings() { onSettings() }
     @objc private func feedback() {
         guard let url = URL(string: "https://my.feishu.cn/share/base/form/shrcn4PO31W5r1nKbtg4xmMuw7f") else { return }

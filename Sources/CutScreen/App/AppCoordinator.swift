@@ -23,25 +23,31 @@ final class AppCoordinator {
         hotKeyManager.onPressed = { [weak self] in
             self?.handleCaptureShortcut()
         }
-        registerSavedHotKey()
+        let hotKeyIsReady = registerSavedHotKey()
         permissionGuideController.presentIfNeeded()
+        if hotKeyIsReady, permissionGuideController.window?.isVisible != true {
+            statusBarController.showLaunchHint(shortcut: settings.hotKey.displayName)
+        }
     }
 
     func stop() {
         captureCoordinator.cancel()
         permissionGuideController.close()
+        statusBarController.dismissLaunchHint()
         hotKeyManager.unregister()
     }
 
-    private func registerSavedHotKey() {
+    private func registerSavedHotKey() -> Bool {
         do {
             try hotKeyManager.register(settings.hotKey)
             statusBarController.setShortcut(settings.hotKey.displayName)
             settings.hotKeyError = nil
+            return true
         } catch {
             settings.hotKeyError = "快捷键 \(settings.hotKey.displayName) 已被占用，请在设置中修改。"
             statusBarController.showError(settings.hotKeyError)
             logger.error("Failed to register hot key: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
@@ -67,6 +73,7 @@ final class AppCoordinator {
     }
 
     private func handleCaptureShortcut() {
+        statusBarController.dismissLaunchHint()
         if captureCoordinator.state == .scrolling {
             Task { await captureCoordinator.finishScrolling() }
             return

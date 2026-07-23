@@ -36,4 +36,22 @@ final class ToolbarIconTests: XCTestCase {
             XCTAssertEqual(image.size, CGSize(width: 20, height: 20))
         }
     }
+
+    func testLaunchHintShowsShortcutAndStartsCapture() {
+        var didCapture = false
+        let controller = LaunchHintViewController(shortcut: "⌃⌘A") {
+            didCapture = true
+        }
+        controller.loadViewIfNeeded()
+
+        XCTAssertEqual(controller.shortcutLabel.stringValue, "⌃⌘A")
+        XCTAssertEqual(controller.messageLabel.stringValue, "按下快捷键即可呼出截图面板")
+        XCTAssertEqual(
+            controller.captureButton.identifier,
+            NSUserInterfaceItemIdentifier("launchHintCapture")
+        )
+
+        controller.captureButton.performClick(nil)
+        XCTAssertTrue(didCapture)
+    }
 }
