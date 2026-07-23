@@ -108,6 +108,7 @@ final class CaptureToolbarController: NSWindowController {
         addTool(.ellipse, icon: "ellipse", tooltip: "圆形", to: toolStack)
         addTool(.pencil, icon: "pencil", tooltip: "铅笔", to: toolStack)
         addTool(.arrow, icon: "arrow", tooltip: "箭头", to: toolStack)
+        addTool(.text, icon: "text", tooltip: "文字", to: toolStack)
         addTool(.serial, icon: "serial", tooltip: "序号", to: toolStack)
         addTool(.mosaic, icon: "mosaic", tooltip: "马赛克", to: toolStack)
         addTool(.magnifier, icon: "magnifier", tooltip: "放大镜", to: toolStack)

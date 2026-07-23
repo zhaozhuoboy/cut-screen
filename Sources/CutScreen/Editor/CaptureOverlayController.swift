@@ -103,6 +103,8 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     private var obscuredPreviewImages: [MosaicPreviewKey: NSImage] = [:]
     private var serialTextField: NSTextField?
     private var editingSerialID: UUID?
+    private var textAnnotationField: NSTextField?
+    private var editingTextAnnotationID: UUID?
     private var selectionAdjustmentIsActive = false
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
 
@@ -119,7 +121,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     var currentDocument: CaptureDocument? { document }
 
     func beginEditing(document: CaptureDocument, selectionRect: CGRect) {
-        dismissSerialTextField()
+        dismissInlineTextFields()
         self.document = document
         self.selectionRect = selectionRect
         mode = .editing
@@ -131,7 +133,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     }
 
     func beginScrollingMask(selectionRect: CGRect) {
-        dismissSerialTextField()
+        dismissInlineTextFields()
         self.selectionRect = selectionRect
         mode = .scrolling
         interaction = .none
@@ -141,6 +143,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     }
 
     func setTool(_ tool: EditorTool) {
+        commitInlineTextEditing()
         self.tool = tool
         selectedAnnotationID = nil
         needsDisplay = true
@@ -148,6 +151,16 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
 
     func setStyle(_ style: AnnotationStyle) {
         self.style = style
+        guard tool == .text,
+              let id = editingTextAnnotationID,
+              var annotation = document?.annotations.first(where: { $0.id == id }),
+              case .text(let origin, let content, _) = annotation.kind else { return }
+        let fontSize = TextAnnotationMetrics.fontSize(lineWidth: style.lineWidth)
+        annotation.kind = .text(origin: origin, content: content, fontSize: fontSize)
+        annotation.style = style
+        document?.replace(annotation)
+        updateTextAnnotationFieldAppearance(annotation)
+        notifyDocumentChanged()
     }
 
     func setMosaicConfiguration(_ configuration: MosaicConfiguration) {
@@ -159,14 +172,14 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     }
 
     func undo() {
-        commitSerialTextEditing()
+        commitInlineTextEditing()
         document?.undo()
         selectedAnnotationID = nil
         notifyDocumentChanged()
     }
 
     func redo() {
-        commitSerialTextEditing()
+        commitInlineTextEditing()
         document?.redo()
         notifyDocumentChanged()
     }
@@ -174,6 +187,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     func deleteSelection() {
         guard let selectedAnnotationID else { return }
         if editingSerialID == selectedAnnotationID { dismissSerialTextField() }
+        if editingTextAnnotationID == selectedAnnotationID { dismissTextAnnotationField() }
         document?.remove(id: selectedAnnotationID)
         self.selectedAnnotationID = nil
         notifyDocumentChanged()
@@ -271,7 +285,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         let point = convert(event.locationInWindow, from: nil)
 
         if mode == .editing, event.clickCount == 2, selectionRect?.contains(point) == true {
-            commitSerialTextEditing()
+            commitInlineTextEditing()
             onConfirm?()
             return
         }
@@ -362,9 +376,15 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         case .movingAnnotation(let id, _, let start):
             let current = viewToDocument(point) ?? start
             if hypot(current.x - start.x, current.y - start.y) < 2,
-               let annotation = document?.annotations.first(where: { $0.id == id }),
-               case .serial = annotation.kind {
-                beginSerialTextEditing(annotation)
+               let annotation = document?.annotations.first(where: { $0.id == id }) {
+                switch annotation.kind {
+                case .serial:
+                    beginSerialTextEditing(annotation)
+                case .text:
+                    beginTextAnnotationEditing(annotation)
+                default:
+                    notifyDocumentChanged()
+                }
             } else {
                 notifyDocumentChanged()
             }
@@ -402,8 +422,12 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
-        guard notification.object as? NSTextField === serialTextField else { return }
-        commitSerialTextEditing()
+        guard let field = notification.object as? NSTextField else { return }
+        if field === serialTextField {
+            commitSerialTextEditing()
+        } else if field === textAnnotationField {
+            commitTextAnnotationEditing()
+        }
     }
 
     func control(
@@ -413,14 +437,14 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     ) -> Bool {
         if commandSelector == #selector(NSResponder.insertNewline(_:))
             || commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-            commitSerialTextEditing()
+            commitInlineTextEditing()
             return true
         }
         return false
     }
 
     private func beginSerialTextEditing(_ annotation: Annotation) {
-        commitSerialTextEditing()
+        commitInlineTextEditing()
         guard case .serial(let center, _, let text) = annotation.kind,
               let selectionRect else { return }
 
@@ -499,6 +523,116 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         editingSerialID = nil
     }
 
+    private func beginTextAnnotationEditing(_ annotation: Annotation) {
+        commitInlineTextEditing()
+        guard case .text(let origin, let content, _) = annotation.kind,
+              let selectionRect else { return }
+
+        let viewOrigin = documentToView(origin)
+        let fontSize = TextAnnotationMetrics.fontSize(lineWidth: annotation.style.lineWidth) * displayScale
+        let height = max(28, fontSize + 10)
+        let x = max(selectionRect.minX + 4, viewOrigin.x)
+        let width = max(80, min(360, selectionRect.maxX - x - 6))
+        let y = min(
+            max(selectionRect.minY + 2, viewOrigin.y - (height - fontSize) / 2),
+            max(selectionRect.minY + 2, selectionRect.maxY - height - 2)
+        )
+
+        let field = NSTextField(frame: CGRect(x: x, y: y, width: width, height: height))
+        field.stringValue = content
+        field.font = .systemFont(ofSize: fontSize, weight: .medium)
+        field.textColor = annotation.style.color.nsColor
+        field.isBezeled = false
+        field.isBordered = false
+        field.drawsBackground = false
+        field.backgroundColor = .clear
+        field.focusRingType = .none
+        field.maximumNumberOfLines = 1
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.delegate = self
+        field.target = self
+        field.action = #selector(commitTextAnnotationFromField(_:))
+
+        textAnnotationField = field
+        editingTextAnnotationID = annotation.id
+        addSubview(field)
+        window?.makeFirstResponder(field)
+        if let editor = field.currentEditor() as? NSTextView {
+            editor.drawsBackground = false
+            editor.backgroundColor = .clear
+            editor.insertionPointColor = annotation.style.color.nsColor
+            editor.selectedRange = NSRange(location: (content as NSString).length, length: 0)
+        }
+    }
+
+    @objc private func commitTextAnnotationFromField(_ sender: NSTextField) {
+        commitTextAnnotationEditing()
+    }
+
+    private func commitTextAnnotationEditing() {
+        guard let field = textAnnotationField, let id = editingTextAnnotationID else { return }
+        let content = String(
+            field.stringValue
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefix(120)
+        )
+        dismissTextAnnotationField()
+
+        guard var annotation = document?.annotations.first(where: { $0.id == id }),
+              case .text(let origin, _, let fontSize) = annotation.kind else { return }
+        guard !content.isEmpty else {
+            document?.discard(id: id)
+            selectedAnnotationID = nil
+            notifyDocumentChanged()
+            window?.makeFirstResponder(self)
+            return
+        }
+        annotation.kind = .text(origin: origin, content: content, fontSize: fontSize)
+        document?.replace(annotation)
+        selectedAnnotationID = id
+        notifyDocumentChanged()
+        window?.makeFirstResponder(self)
+    }
+
+    private func dismissTextAnnotationField() {
+        textAnnotationField?.delegate = nil
+        textAnnotationField?.removeFromSuperview()
+        textAnnotationField = nil
+        editingTextAnnotationID = nil
+    }
+
+    private func dismissInlineTextFields() {
+        dismissSerialTextField()
+        dismissTextAnnotationField()
+    }
+
+    private func commitInlineTextEditing() {
+        commitSerialTextEditing()
+        commitTextAnnotationEditing()
+    }
+
+    private func updateTextAnnotationFieldAppearance(_ annotation: Annotation) {
+        guard let field = textAnnotationField,
+              case .text(let origin, _, _) = annotation.kind,
+              let selectionRect else { return }
+        let fontSize = TextAnnotationMetrics.fontSize(lineWidth: annotation.style.lineWidth) * displayScale
+        let height = max(28, fontSize + 10)
+        let viewOrigin = documentToView(origin)
+        var frame = field.frame
+        frame.size.height = height
+        frame.origin.y = min(
+            max(selectionRect.minY + 2, viewOrigin.y - (height - fontSize) / 2),
+            max(selectionRect.minY + 2, selectionRect.maxY - height - 2)
+        )
+        field.frame = frame
+        field.font = .systemFont(ofSize: fontSize, weight: .medium)
+        field.textColor = annotation.style.color.nsColor
+        if let editor = field.currentEditor() as? NSTextView {
+            editor.insertionPointColor = annotation.style.color.nsColor
+        }
+    }
+
     private func beginEditingInteraction(at viewPoint: CGPoint) {
         guard let document, let selectionRect, selectionRect.contains(viewPoint), let documentPoint = viewToDocument(viewPoint) else { return }
 
@@ -544,6 +678,22 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
             return
         }
 
+        if tool == .text {
+            let annotation = Annotation(
+                kind: .text(
+                    origin: documentPoint,
+                    content: "",
+                    fontSize: TextAnnotationMetrics.fontSize(lineWidth: style.lineWidth)
+                ),
+                style: style
+            )
+            document.add(annotation)
+            selectedAnnotationID = annotation.id
+            notifyDocumentChanged()
+            beginTextAnnotationEditing(annotation)
+            return
+        }
+
         interaction = .drawing(start: documentPoint, points: [documentPoint])
         updatePreview(start: documentPoint, current: documentPoint, points: [documentPoint])
     }
@@ -555,7 +705,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
             operation: .copy,
             fraction: 1,
             respectFlipped: false,
-            hints: [.interpolation: NSImageInterpolation.high]
+            hints: [.interpolation: NSImageInterpolation.none]
         )
     }
 
@@ -586,7 +736,7 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         guard let document else { return }
         let source = visibleSourceRect
         let image = NSImage(cgImage: document.baseImage, size: document.pointSize)
-        image.draw(in: rect, from: source, operation: .copy, fraction: 1, respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
+        image.draw(in: rect, from: source, operation: .copy, fraction: 1, respectFlipped: false, hints: [.interpolation: NSImageInterpolation.none])
 
         if document.annotations.contains(where: { if case .mosaic = $0.kind { return true }; return false }) || (previewAnnotation.map { if case .mosaic = $0.kind { return true }; return false } ?? false) {
             drawMosaicAnnotations(document.annotations + [previewAnnotation].compactMap { $0 }, in: rect, source: source)
@@ -599,18 +749,20 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
         for annotation in document.annotations where !self.isMosaic(annotation) {
             let displayedAnnotation = annotationForDisplay(annotation)
             if isMagnifier(displayedAnnotation) {
-                drawMagnifier(displayedAnnotation, image: image, in: rect, source: source, context: context)
+                drawMagnifier(displayedAnnotation, in: context)
             }
             AnnotationPainter.draw(displayedAnnotation, in: context, transform: transform, scale: displayScale)
         }
         if let previewAnnotation, !isMosaic(previewAnnotation) {
             if isMagnifier(previewAnnotation) {
-                drawMagnifier(previewAnnotation, image: image, in: rect, source: source, context: context)
+                drawMagnifier(previewAnnotation, in: context)
             }
             AnnotationPainter.draw(previewAnnotation, in: context, transform: transform, scale: displayScale)
         }
 
-        if let selectedAnnotationID, editingSerialID != selectedAnnotationID,
+        if let selectedAnnotationID,
+           editingSerialID != selectedAnnotationID,
+           editingTextAnnotationID != selectedAnnotationID,
            let selected = document.annotations.first(where: { $0.id == selectedAnnotationID }) {
             drawAnnotationSelection(selected)
         }
@@ -618,12 +770,10 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
 
     private func drawMagnifier(
         _ annotation: Annotation,
-        image: NSImage,
-        in rect: CGRect,
-        source: CGRect,
-        context: CGContext
+        in context: CGContext
     ) {
-        guard case .magnifier(let lensRect, let zoom) = annotation.kind else { return }
+        guard case .magnifier(let lensRect, let zoom) = annotation.kind,
+              let document else { return }
         let first = documentToView(lensRect.origin)
         let second = documentToView(CGPoint(x: lensRect.maxX, y: lensRect.maxY))
         let lens = CGRect(
@@ -632,17 +782,31 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
             width: abs(second.x - first.x),
             height: abs(second.y - first.y)
         )
-        guard lens.width > 1, lens.height > 1 else { return }
+        let sourcePixelRect = MagnifierGeometry.sourcePixelRect(
+            lensRect: lensRect,
+            zoom: zoom,
+            documentPointSize: document.pointSize,
+            imagePixelSize: CGSize(width: document.baseImage.width, height: document.baseImage.height)
+        )
+        guard lens.width > 1,
+              lens.height > 1,
+              let magnified = MagnifierImageRenderer.render(
+                source: document.baseImage,
+                sourcePixelRect: sourcePixelRect,
+                targetPixelSize: CGSize(
+                    width: lens.width * (window?.backingScaleFactor ?? display.scale),
+                    height: lens.height * (window?.backingScaleFactor ?? display.scale)
+                ),
+                context: ciContext
+              ) else { return }
+        let magnifiedImage = NSImage(cgImage: magnified, size: lens.size)
 
         context.saveGState()
         context.addEllipse(in: lens)
         context.clip()
-        context.translateBy(x: lens.midX, y: lens.midY)
-        context.scaleBy(x: max(1, zoom), y: max(1, zoom))
-        context.translateBy(x: -lens.midX, y: -lens.midY)
-        image.draw(
-            in: rect,
-            from: source,
+        magnifiedImage.draw(
+            in: lens,
+            from: .zero,
             operation: .copy,
             fraction: 1,
             respectFlipped: false,
@@ -934,11 +1098,19 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
     }
 
     private func annotationForDisplay(_ annotation: Annotation) -> Annotation {
-        guard editingSerialID == annotation.id,
-              case .serial(let center, let number, _) = annotation.kind else { return annotation }
-        var displayed = annotation
-        displayed.kind = .serial(center: center, number: number, text: "")
-        return displayed
+        if editingSerialID == annotation.id,
+           case .serial(let center, let number, _) = annotation.kind {
+            var displayed = annotation
+            displayed.kind = .serial(center: center, number: number, text: "")
+            return displayed
+        }
+        if editingTextAnnotationID == annotation.id,
+           case .text(let origin, _, let fontSize) = annotation.kind {
+            var displayed = annotation
+            displayed.kind = .text(origin: origin, content: "", fontSize: fontSize)
+            return displayed
+        }
+        return annotation
     }
 
     private func isMagnifier(_ annotation: Annotation) -> Bool {

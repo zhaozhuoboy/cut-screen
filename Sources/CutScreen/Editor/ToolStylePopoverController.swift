@@ -96,6 +96,7 @@ final class ToolStyleViewController: NSViewController {
         let diameters: [CGFloat] = [5, 9, 14]
         let names: [String]
         switch tool {
+        case .text: names = ["小", "中", "大"]
         case .serial: names = ["小", "中", "大"]
         case .mosaic: names = ["低", "中", "高"]
         default: names = ["细", "中", "粗"]
@@ -106,7 +107,9 @@ final class ToolStyleViewController: NSViewController {
         choices.spacing = 5
         for index in values.indices {
             let button = GlassToolbarButton()
-            button.image = Self.dotImage(diameter: diameters[index])
+            button.image = tool == .text
+                ? Self.fontSizeImage(fontSize: [10, 14, 18][index])
+                : Self.dotImage(diameter: diameters[index])
             button.imagePosition = .imageOnly
             button.identifier = NSUserInterfaceItemIdentifier(String(Double(values[index])))
             button.target = self
@@ -240,6 +243,23 @@ final class ToolStyleViewController: NSViewController {
         return image
     }
 
+    private static func fontSizeImage(fontSize: CGFloat) -> NSImage {
+        let image = NSImage(size: CGSize(width: 20, height: 20), flipped: false) { rect in
+            let text = NSAttributedString(
+                string: "A",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
+                    .foregroundColor: NSColor.labelColor
+                ]
+            )
+            let size = text.size()
+            text.draw(at: CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
     @objc private func selectColor(_ sender: NSButton) {
         guard let rawValue = sender.identifier?.rawValue,
               let color = AnnotationColor(rawValue: rawValue) else { return }
@@ -317,6 +337,7 @@ private extension EditorTool {
         case .ellipse: return "圆形"
         case .pencil: return "铅笔"
         case .arrow: return "箭头"
+        case .text: return "文字"
         case .serial: return "序号"
         case .mosaic: return "马赛克"
         case .magnifier: return "放大镜"
@@ -327,6 +348,7 @@ private extension EditorTool {
 
     var widthLabel: String {
         switch self {
+        case .text: return "字号"
         case .serial: return "大小"
         case .mosaic: return "强度"
         default: return "粗细"

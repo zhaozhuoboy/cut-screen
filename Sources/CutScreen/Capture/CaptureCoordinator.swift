@@ -152,9 +152,10 @@ final class CaptureCoordinator {
     }
 
     private func commitSelection(display: CapturedDisplay, localRect: CGRect) {
-        guard state == .selecting, let image = display.crop(localRect: localRect) else { return }
-        let selection = Selection(displayID: display.displayID, screenFrame: display.screenFrame, localRect: localRect)
-        let frame = CapturedFrame(image: image, pointSize: localRect.size, scale: display.scale)
+        let alignedRect = display.pixelAlignedLocalRect(localRect)
+        guard state == .selecting, let image = display.crop(localRect: alignedRect) else { return }
+        let selection = Selection(displayID: display.displayID, screenFrame: display.screenFrame, localRect: alignedRect)
+        let frame = CapturedFrame(image: image, pointSize: alignedRect.size, scale: display.scale)
         let document = CaptureDocument(frame: frame)
 
         activeDisplay = display
@@ -165,7 +166,7 @@ final class CaptureCoordinator {
             controller.window?.orderOut(nil)
         }
         overlayControllers = [activeOverlay].compactMap { $0 }
-        activeOverlay?.beginEditing(document: document, selectionRect: localRect)
+        activeOverlay?.beginEditing(document: document, selectionRect: alignedRect)
         installToolbar()
         installAppearanceToolbar()
         toolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
@@ -178,12 +179,14 @@ final class CaptureCoordinator {
     }
 
     private func adjustSelection(to localRect: CGRect) {
-        guard state == .editing, let activeDisplay, let image = activeDisplay.crop(localRect: localRect),
+        guard state == .editing, let activeDisplay else { return }
+        let alignedRect = activeDisplay.pixelAlignedLocalRect(localRect)
+        guard let image = activeDisplay.crop(localRect: alignedRect),
               document?.hasAnnotations == false else { return }
-        selection?.localRect = localRect
-        let frame = CapturedFrame(image: image, pointSize: localRect.size, scale: activeDisplay.scale)
+        selection?.localRect = alignedRect
+        let frame = CapturedFrame(image: image, pointSize: alignedRect.size, scale: activeDisplay.scale)
         document?.replaceBase(with: frame)
-        if let document { activeOverlay?.beginEditing(document: document, selectionRect: localRect) }
+        if let document { activeOverlay?.beginEditing(document: document, selectionRect: alignedRect) }
         if let selection {
             toolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)
             appearanceToolbarController?.position(relativeTo: selection.globalRect, in: selection.screenFrame)

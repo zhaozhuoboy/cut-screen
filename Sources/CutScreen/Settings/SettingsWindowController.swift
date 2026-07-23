@@ -58,7 +58,14 @@ final class SettingsWindowController: NSWindowController {
         messageLabel.maximumNumberOfLines = 2
         messageLabel.lineBreakMode = .byWordWrapping
 
-        let stack = NSStackView(views: [shortcutRow, loginCheckbox, messageLabel])
+        let contactLabel = NSTextField(labelWithString: "QQ群：237800385")
+        contactLabel.font = .systemFont(ofSize: 12)
+        contactLabel.textColor = .secondaryLabelColor
+        contactLabel.isSelectable = true
+        contactLabel.toolTip = "可选择并复制 QQ 群号"
+        contactLabel.setAccessibilityLabel("QQ 群 237800385")
+
+        let stack = NSStackView(views: [shortcutRow, loginCheckbox, messageLabel, contactLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 20

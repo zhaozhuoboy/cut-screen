@@ -2,7 +2,7 @@ import AppKit
 
 struct CaptureAppearance: Equatable {
     static let maximumCornerRadius: CGFloat = 32
-    static let defaultShadowStrength: CGFloat = 0.75
+    static let defaultShadowStrength: CGFloat = 0.4
 
     var cornerRadius: CGFloat = 16
     var shadowStrength: CGFloat = defaultShadowStrength

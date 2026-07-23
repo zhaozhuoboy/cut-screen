@@ -22,7 +22,7 @@ final class ToolbarIconTests: XCTestCase {
 
     func testAllToolbarIconsLoadAsVectorImages() throws {
         let names = [
-            "rectangle", "ellipse", "pencil", "arrow", "serial", "mosaic", "magnifier",
+            "rectangle", "ellipse", "pencil", "arrow", "text", "serial", "mosaic", "magnifier",
             "undo", "redo", "scroll", "pin", "save", "cancel", "confirm",
             "corner-radius", "shadow", "mosaic-pixelate", "mosaic-blur",
             "mosaic-brush", "mosaic-rectangle", "status-viewfinder-bolt"

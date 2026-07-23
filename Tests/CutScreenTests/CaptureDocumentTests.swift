@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import XCTest
 @testable import CutScreen
 
@@ -48,6 +49,41 @@ final class CaptureDocumentTests: XCTestCase {
         )
     }
 
+    func testTextAnnotationCanBeMovedAndSelected() {
+        let annotation = Annotation(
+            kind: .text(origin: CGPoint(x: 10, y: 12), content: "重点说明", fontSize: 24),
+            style: .init(color: .green, lineWidth: 4)
+        )
+
+        XCTAssertTrue(AnnotationPainter.hitTest(annotation, point: CGPoint(x: 20, y: 20)))
+        XCTAssertEqual(
+            annotation.kind.translated(by: CGPoint(x: 5, y: -2)),
+            .text(origin: CGPoint(x: 15, y: 10), content: "重点说明", fontSize: 24)
+        )
+        XCTAssertEqual(TextAnnotationMetrics.fontSize(lineWidth: 2), 16)
+        XCTAssertEqual(TextAnnotationMetrics.fontSize(lineWidth: 4), 24)
+        XCTAssertEqual(TextAnnotationMetrics.fontSize(lineWidth: 8), 36)
+    }
+
+    func testTextAnnotationIsRenderedIntoExport() throws {
+        let document = CaptureDocument(frame: try makeFrame(width: 180, height: 80))
+        document.setAppearance(CaptureAppearance(cornerRadius: 0, hasShadow: false))
+        document.add(Annotation(
+            kind: .text(origin: CGPoint(x: 12, y: 22), content: "轻截文字", fontSize: 24),
+            style: .init(color: .black, lineWidth: 4)
+        ))
+
+        let rendered = try ImageExporter().render(document)
+        XCTAssertGreaterThan(
+            GrayFrameMatcher.meanDifference(
+                GrayFrame(image: document.baseImage, targetWidth: 180, maximumHeight: 80),
+                GrayFrame(image: rendered, targetWidth: 180, maximumHeight: 80),
+                shift: 0
+            ),
+            1
+        )
+    }
+
     func testSerialMarkerIsCompactAndNoteTextIsMoreReadable() {
         XCTAssertEqual(SerialAnnotationMetrics.radius(lineWidth: 4), 11)
         XCTAssertEqual(SerialAnnotationMetrics.numberFontSize(lineWidth: 4), 11)
@@ -62,6 +98,7 @@ final class CaptureDocumentTests: XCTestCase {
             .ellipse(CGRect(x: 2, y: 3, width: 9, height: 6)),
             .pencil([CGPoint(x: 3, y: 4), CGPoint(x: 8, y: 9)]),
             .arrow(start: CGPoint(x: 4, y: 5), end: CGPoint(x: 10, y: 12)),
+            .text(origin: CGPoint(x: 5, y: 6), content: "文字", fontSize: 24),
             .serial(center: CGPoint(x: 14, y: 16), number: 1, text: "说明"),
             .magnifier(rect: CGRect(x: 6, y: 7, width: 18, height: 16), zoom: 2),
             .mosaic(MosaicAnnotation(
@@ -185,6 +222,30 @@ final class CaptureDocumentTests: XCTestCase {
         )
     }
 
+    func testMagnifierCropsOriginalPixelsAtRequestedZoom() {
+        let source = MagnifierGeometry.sourcePixelRect(
+            lensRect: CGRect(x: 20, y: 15, width: 40, height: 30),
+            zoom: 2,
+            documentPointSize: CGSize(width: 80, height: 60),
+            imagePixelSize: CGSize(width: 160, height: 120)
+        )
+
+        XCTAssertEqual(source, CGRect(x: 60, y: 45, width: 40, height: 30))
+    }
+
+    func testMagnifierUsesHighQualityUpscalingAtRequestedSize() throws {
+        let source = makeGradientImage(width: 20, height: 16)
+        let rendered = try XCTUnwrap(MagnifierImageRenderer.render(
+            source: source,
+            sourcePixelRect: CGRect(x: 4, y: 4, width: 10, height: 8),
+            targetPixelSize: CGSize(width: 40, height: 32),
+            context: CIContext(options: [.cacheIntermediates: false])
+        ))
+
+        XCTAssertEqual(rendered.width, 40)
+        XCTAssertEqual(rendered.height, 32)
+    }
+
     func testMagnifierUsesFixedOutlineInsteadOfAnnotationStyle() throws {
         let base = makeGradientImage(width: 60, height: 44)
         func rendered(style: AnnotationStyle) throws -> CGImage {
@@ -255,7 +316,7 @@ final class CaptureDocumentTests: XCTestCase {
 
         XCTAssertEqual(document.appearance.cornerRadius, 16)
         XCTAssertTrue(document.appearance.hasShadow)
-        XCTAssertEqual(document.appearance.shadowStrength, 0.75)
+        XCTAssertEqual(document.appearance.shadowStrength, 0.4)
     }
 
     func testAppearanceSlidersUseContinuousCornerAndShadowValues() {
@@ -275,10 +336,10 @@ final class CaptureDocumentTests: XCTestCase {
 
         let rendered = try ImageExporter().render(document)
 
-        XCTAssertEqual(rendered.width, 88)
-        XCTAssertEqual(rendered.height, 78)
+        XCTAssertEqual(rendered.width, 72)
+        XCTAssertEqual(rendered.height, 62)
         XCTAssertEqual(alpha(of: rendered, x: 0, y: 0), 0)
-        XCTAssertEqual(alpha(of: rendered, x: 44, y: 39), 255)
+        XCTAssertEqual(alpha(of: rendered, x: 36, y: 31), 255)
     }
 
     private func makeFrame(width: Int = 40, height: Int = 30) throws -> CapturedFrame {

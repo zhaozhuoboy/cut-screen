@@ -43,6 +43,11 @@ final class CaptureDocument {
         redoAnnotations.append(annotations.remove(at: index))
     }
 
+    func discard(id: UUID) {
+        annotations.removeAll { $0.id == id }
+        redoAnnotations.removeAll()
+    }
+
     func undo() {
         guard let annotation = annotations.popLast() else { return }
         redoAnnotations.append(annotation)

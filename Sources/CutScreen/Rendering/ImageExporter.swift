@@ -89,9 +89,7 @@ final class ImageExporter: ScreenshotExporting {
                     source: magnifierSource,
                     in: context,
                     transform: transform,
-                    scale: scaleX,
-                    width: width,
-                    height: height
+                    documentPointSize: document.pointSize
                 )
                 AnnotationPainter.draw(annotation, in: context, transform: transform, scale: scaleX)
             default:
@@ -199,21 +197,30 @@ final class ImageExporter: ScreenshotExporting {
         source: CGImage,
         in context: CGContext,
         transform: AnnotationPainter.PointTransform,
-        scale: CGFloat,
-        width: Int,
-        height: Int
+        documentPointSize: CGSize
     ) {
         guard case .magnifier(let rect, let zoom) = annotation.kind else { return }
         let lens = AnnotationPainter.transformed(rect, transform: transform)
-        guard lens.width > 1, lens.height > 1 else { return }
+        let sourcePixelRect = MagnifierGeometry.sourcePixelRect(
+            lensRect: rect,
+            zoom: zoom,
+            documentPointSize: documentPointSize,
+            imagePixelSize: CGSize(width: source.width, height: source.height)
+        )
+        guard lens.width > 1,
+              lens.height > 1,
+              let magnified = MagnifierImageRenderer.render(
+                source: source,
+                sourcePixelRect: sourcePixelRect,
+                targetPixelSize: lens.size,
+                context: ciContext
+              ) else { return }
 
         context.saveGState()
         context.addEllipse(in: lens)
         context.clip()
-        context.translateBy(x: lens.midX, y: lens.midY)
-        context.scaleBy(x: max(1, zoom), y: max(1, zoom))
-        context.translateBy(x: -lens.midX, y: -lens.midY)
-        drawBase(source, in: context, width: width, height: height)
+        context.interpolationQuality = .high
+        context.draw(magnified, in: lens)
         context.restoreGState()
     }
 

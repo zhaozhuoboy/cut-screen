@@ -6,6 +6,7 @@ enum EditorTool: String, CaseIterable {
     case ellipse
     case pencil
     case arrow
+    case text
     case serial
     case mosaic
     case magnifier
@@ -54,6 +55,50 @@ enum SerialAnnotationMetrics {
 
     static func noteFontSize(lineWidth: CGFloat) -> CGFloat {
         max(14, 12 + lineWidth / 2)
+    }
+}
+
+enum TextAnnotationMetrics {
+    static func fontSize(lineWidth: CGFloat) -> CGFloat {
+        if lineWidth <= 2 { return 16 }
+        if lineWidth >= 8 { return 36 }
+        return 24
+    }
+
+    static func size(for text: String, fontSize: CGFloat) -> CGSize {
+        let measuredText = text.isEmpty ? " " : text
+        let size = (measuredText as NSString).size(withAttributes: [
+            .font: NSFont.systemFont(ofSize: fontSize, weight: .medium)
+        ])
+        return CGSize(width: max(2, ceil(size.width)), height: ceil(size.height))
+    }
+}
+
+enum MagnifierGeometry {
+    static func sourcePixelRect(
+        lensRect: CGRect,
+        zoom: CGFloat,
+        documentPointSize: CGSize,
+        imagePixelSize: CGSize
+    ) -> CGRect {
+        guard zoom > 0,
+              documentPointSize.width > 0,
+              documentPointSize.height > 0,
+              imagePixelSize.width > 0,
+              imagePixelSize.height > 0 else { return .zero }
+
+        let lens = lensRect.standardized
+        let scaleX = imagePixelSize.width / documentPointSize.width
+        let scaleY = imagePixelSize.height / documentPointSize.height
+        let sourceWidth = max(1, (lens.width / zoom * scaleX).rounded())
+        let sourceHeight = max(1, (lens.height / zoom * scaleY).rounded())
+        let centerX = lens.midX * scaleX
+        let centerY = (documentPointSize.height - lens.midY) * scaleY
+        let maximumX = max(0, imagePixelSize.width - sourceWidth)
+        let maximumY = max(0, imagePixelSize.height - sourceHeight)
+        let x = min(max(0, (centerX - sourceWidth / 2).rounded()), maximumX)
+        let y = min(max(0, (centerY - sourceHeight / 2).rounded()), maximumY)
+        return CGRect(x: x, y: y, width: sourceWidth, height: sourceHeight)
     }
 }
 
@@ -108,6 +153,7 @@ enum AnnotationKind: Equatable {
     case ellipse(CGRect)
     case pencil([CGPoint])
     case arrow(start: CGPoint, end: CGPoint)
+    case text(origin: CGPoint, content: String, fontSize: CGFloat)
     case serial(center: CGPoint, number: Int, text: String)
     case mosaic(MosaicAnnotation)
     case magnifier(rect: CGRect, zoom: CGFloat)
@@ -130,6 +176,8 @@ enum AnnotationKind: Equatable {
                 width: abs(end.x - start.x),
                 height: abs(end.y - start.y)
             )
+        case .text(let origin, let content, let fontSize):
+            return CGRect(origin: origin, size: TextAnnotationMetrics.size(for: content, fontSize: fontSize))
         case .serial(let center, _, let text):
             let marker = CGRect(x: center.x - 12, y: center.y - 12, width: 24, height: 24)
             guard !text.isEmpty else { return marker }
@@ -153,6 +201,8 @@ enum AnnotationKind: Equatable {
         case .ellipse(let rect): return .ellipse(rect.offsetBy(dx: delta.x, dy: delta.y))
         case .pencil(let points): return .pencil(points.map(move))
         case .arrow(let start, let end): return .arrow(start: move(start), end: move(end))
+        case .text(let origin, let content, let fontSize):
+            return .text(origin: move(origin), content: content, fontSize: fontSize)
         case .serial(let center, let number, let text):
             return .serial(center: move(center), number: number, text: text)
         case .mosaic(var mosaic):

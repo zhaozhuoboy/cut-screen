@@ -36,6 +36,14 @@ enum AnnotationPainter {
             stroke(points, context: context, transform: transform)
         case .arrow(let start, let end):
             drawArrow(start: transform(start), end: transform(end), context: context, width: lineWidth)
+        case .text(let origin, let content, let fontSize):
+            drawText(
+                content,
+                at: transform(origin),
+                context: context,
+                color: annotation.style.color.nsColor,
+                fontSize: fontSize * scale
+            )
         case .serial(let center, let number, let text):
             drawSerial(
                 center: transform(center),
@@ -93,6 +101,8 @@ enum AnnotationPainter {
         case .arrow(let start, let end):
             return distance(from: point, toSegmentFrom: start, to: end) <= width
                 || hypot(point.x - end.x, point.y - end.y) <= max(12, annotation.style.lineWidth * 4) + tolerance
+        case .text:
+            return annotation.kind.bounds.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
         case .serial:
             return annotation.kind.bounds.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
         case .mosaic(let mosaic):
@@ -158,6 +168,27 @@ enum AnnotationPainter {
         context.addLine(to: end)
         context.addLine(to: right)
         context.strokePath()
+    }
+
+    private static func drawText(
+        _ content: String,
+        at origin: CGPoint,
+        context: CGContext,
+        color: NSColor,
+        fontSize: CGFloat
+    ) {
+        guard !content.isEmpty else { return }
+        let attributedText = NSAttributedString(
+            string: content,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
+                .foregroundColor: color
+            ]
+        )
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        attributedText.draw(at: origin)
+        NSGraphicsContext.restoreGraphicsState()
     }
 
     private static func drawSerial(
