@@ -47,11 +47,10 @@ final class ScrollCaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @u
         )
         configuration.width = max(1, Int(selection.localRect.width * scale))
         configuration.height = max(1, Int(selection.localRect.height * scale))
-        // Sampling every display refresh creates many nearly identical frames
-        // during trackpad momentum scrolling. 15 fps still preserves generous
-        // overlap while giving the viewport enough time to move between frames.
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 15)
-        configuration.queueDepth = 1
+        // 20 fps keeps enough overlap for mouse-wheel jumps and trackpad
+        // momentum without flooding the stitcher with near-duplicate frames.
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 20)
+        configuration.queueDepth = 2
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.showsCursor = false
         configuration.capturesAudio = false

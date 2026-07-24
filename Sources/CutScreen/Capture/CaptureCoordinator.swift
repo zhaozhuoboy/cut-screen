@@ -29,7 +29,10 @@ final class CaptureCoordinator {
     private var appearanceToolbarController: CaptureAppearanceToolbarController?
     private var scrollSession: ScrollCaptureSession?
     private var scrollHUD: ScrollCaptureHUDController?
+    private var scrollInputRelay = ScrollInputRelay()
     private var sourceApplication: NSRunningApplication?
+    private var sourceActivationObserver: (any NSObjectProtocol)?
+    private var isReassertingSourceActivation = false
 
     init() {
         let detector = SystemWindowDetector()
@@ -41,6 +44,7 @@ final class CaptureCoordinator {
 
     func begin() {
         guard state == .idle else { return }
+        sourceApplication = nil
         if let frontmost = NSWorkspace.shared.frontmostApplication,
            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             sourceApplication = frontmost
@@ -84,6 +88,8 @@ final class CaptureCoordinator {
               let selection, let activeDisplay, let document else { return }
         state = .exporting
         escapeHotKeyManager.unregister()
+        endSourceActivationKeeper()
+        scrollInputRelay.remove()
         scrollHUD?.close()
         scrollHUD = nil
         scrollSession = nil
@@ -157,6 +163,13 @@ final class CaptureCoordinator {
         let selection = Selection(displayID: display.displayID, screenFrame: display.screenFrame, localRect: alignedRect)
         let frame = CapturedFrame(image: image, pointSize: alignedRect.size, scale: display.scale)
         let document = CaptureDocument(frame: frame)
+        if let processIdentifier = display.ownerProcessIdentifier(
+            at: CGPoint(x: alignedRect.midX, y: alignedRect.midY)
+        ),
+           processIdentifier != ProcessInfo.processInfo.processIdentifier,
+           let selectedApplication = NSRunningApplication(processIdentifier: processIdentifier) {
+            sourceApplication = selectedApplication
+        }
 
         activeDisplay = display
         self.selection = selection
@@ -268,17 +281,76 @@ final class CaptureCoordinator {
         }
         scrollSession = session
         scrollHUD = hud
-        sourceApplication?.activate(options: [.activateIgnoringOtherApps])
+        // Show HUD / relay before activation. Ordering accessory windows after
+        // activating the source can steal focus again and drop scroll events.
         hud.show()
+        scrollInputRelay.install(
+            over: selection.globalRect,
+            targetProcessIdentifier: sourceApplication?.processIdentifier
+        )
+        beginSourceActivationKeeper()
 
         Task {
             do {
-                // Let the source window finish its active/inactive appearance
-                // transition before accepting the first frame as the baseline.
+                await activateSourceApplicationForScrolling()
                 try await Task.sleep(nanoseconds: 120_000_000)
                 try await session.start()
+                // SCStream startup may briefly touch application focus on some
+                // macOS versions. Reaffirm the source before the user scrolls.
+                await activateSourceApplicationForScrolling()
             } catch {
                 restoreEditorAfterScrollFailure(error)
+            }
+        }
+    }
+
+    private func beginSourceActivationKeeper() {
+        endSourceActivationKeeper()
+        sourceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let activatedPID = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?
+                .processIdentifier
+            let ownPID = ProcessInfo.processInfo.processIdentifier
+            Task { @MainActor [weak self] in
+                guard let self, self.state == .scrolling, !self.isReassertingSourceActivation else { return }
+                guard activatedPID == ownPID else { return }
+                await self.activateSourceApplicationForScrolling()
+            }
+        }
+    }
+
+    private func endSourceActivationKeeper() {
+        if let sourceActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(sourceActivationObserver)
+            self.sourceActivationObserver = nil
+        }
+    }
+
+    private func activateSourceApplicationForScrolling() async {
+        guard state == .scrolling else { return }
+        isReassertingSourceActivation = true
+        defer { isReassertingSourceActivation = false }
+
+        guard let sourceApplication, !sourceApplication.isTerminated else {
+            NSApplication.shared.deactivate()
+            return
+        }
+
+        for _ in 0..<4 {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == sourceApplication.processIdentifier {
+                return
+            }
+            NSApplication.shared.deactivate()
+            // Prefer activating the source app without raising every window;
+            // the selected content is already on-screen under the open hole.
+            sourceApplication.activate(options: [.activateIgnoringOtherApps])
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            guard state == .scrolling else { return }
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == sourceApplication.processIdentifier {
+                return
             }
         }
     }
@@ -293,6 +365,8 @@ final class CaptureCoordinator {
 
     private func restoreEditingAfterScroll() {
         escapeHotKeyManager.unregister()
+        endSourceActivationKeeper()
+        scrollInputRelay.remove()
         scrollHUD?.close()
         scrollHUD = nil
         scrollSession = nil
@@ -367,6 +441,8 @@ final class CaptureCoordinator {
 
     private func finishSession() {
         escapeHotKeyManager.unregister()
+        endSourceActivationKeeper()
+        scrollInputRelay.remove()
         scrollHUD?.close()
         toolbarController?.close()
         appearanceToolbarController?.close()

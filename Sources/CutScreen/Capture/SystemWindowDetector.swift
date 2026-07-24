@@ -38,6 +38,7 @@ struct SystemWindowDetector: WindowDetecting {
             return DetectedWindow(
                 windowID: CGWindowID(number.uint32Value),
                 ownerName: info[kCGWindowOwnerName as String] as? String ?? "",
+                ownerProcessIdentifier: ownerPID.int32Value,
                 frame: cocoaFrame,
                 layer: layer.intValue
             )

@@ -2,6 +2,35 @@ import XCTest
 @testable import CutScreen
 
 final class ScrollStitcherTests: XCTestCase {
+    func testScrollOverlayLeavesTheCaptureSelectionUncovered() {
+        let displayBounds = CGRect(x: 0, y: 0, width: 1200, height: 800)
+        let selection = CGRect(x: 180, y: 140, width: 760, height: 500)
+        let masks = ScrollOverlayGeometry.maskRects(
+            in: displayBounds,
+            outside: selection
+        )
+
+        XCTAssertEqual(masks.count, 4)
+        XCTAssertTrue(masks.allSatisfy { $0.intersection(selection).isEmpty })
+        XCTAssertEqual(
+            masks.reduce(CGFloat.zero) { $0 + $1.width * $1.height },
+            displayBounds.width * displayBounds.height - selection.width * selection.height
+        )
+    }
+
+    func testScrollBorderUsesFourThinWindowsOutsideTheSelection() {
+        let screenBounds = CGRect(x: -200, y: 40, width: 1200, height: 800)
+        let selection = CGRect(x: 50, y: 180, width: 600, height: 420)
+        let borders = ScrollOverlayGeometry.borderRects(
+            around: selection,
+            in: screenBounds
+        )
+
+        XCTAssertEqual(borders.count, 4)
+        XCTAssertTrue(borders.allSatisfy { $0.intersection(selection).isEmpty })
+        XCTAssertTrue(borders.allSatisfy { screenBounds.contains($0) })
+    }
+
     func testFindsKnownVerticalShift() {
         let width = 12
         let height = 40
