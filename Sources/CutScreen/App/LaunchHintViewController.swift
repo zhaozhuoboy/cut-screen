@@ -43,15 +43,9 @@ final class LaunchHintViewController: NSViewController {
         messageLabel.textColor = .secondaryLabelColor
 
         shortcutLabel.stringValue = shortcut
-        shortcutLabel.font = .monospacedSystemFont(ofSize: 17, weight: .bold)
-        shortcutLabel.alignment = .center
-        shortcutLabel.textColor = .systemGreen
-        shortcutLabel.wantsLayer = true
-        shortcutLabel.layer?.cornerRadius = 8
-        shortcutLabel.layer?.cornerCurve = .continuous
-        shortcutLabel.layer?.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.12).cgColor
-        shortcutLabel.widthAnchor.constraint(equalToConstant: 88).isActive = true
-        shortcutLabel.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        shortcutLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        shortcutLabel.alignment = .left
+        shortcutLabel.textColor = .labelColor
 
         captureButton.identifier = NSUserInterfaceItemIdentifier("launchHintCapture")
         captureButton.bezelStyle = .rounded

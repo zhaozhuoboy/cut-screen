@@ -81,9 +81,37 @@ final class CaptureGeometryTests: XCTestCase {
         )
     }
 
-    func testPixelColorUsesCapturedImageAndFormatsHexValue() throws {
+    func testWindowOwnerProcessIdentifierUsesTopmostWindowAtPoint() throws {
         let display = CapturedDisplay(
             displayID: 5,
+            screenFrame: CGRect(x: -200, y: 40, width: 200, height: 150),
+            scale: 1,
+            image: try makeImage(width: 200, height: 150),
+            windows: [
+                DetectedWindow(
+                    windowID: 12,
+                    ownerName: "Front",
+                    ownerProcessIdentifier: 101,
+                    frame: CGRect(x: -170, y: 60, width: 100, height: 80),
+                    layer: 0
+                ),
+                DetectedWindow(
+                    windowID: 13,
+                    ownerName: "Back",
+                    ownerProcessIdentifier: 202,
+                    frame: CGRect(x: -180, y: 50, width: 130, height: 100),
+                    layer: 0
+                )
+            ]
+        )
+
+        XCTAssertEqual(display.ownerProcessIdentifier(at: CGPoint(x: 50, y: 40)), 101)
+        XCTAssertNil(display.ownerProcessIdentifier(at: CGPoint(x: 190, y: 140)))
+    }
+
+    func testPixelColorUsesCapturedImageAndFormatsHexValue() throws {
+        let display = CapturedDisplay(
+            displayID: 6,
             screenFrame: CGRect(x: 0, y: 0, width: 1, height: 1),
             scale: 2,
             image: try makeSolidImage(width: 2, height: 2, rgba: [0x12, 0x34, 0x56, 0xFF]),

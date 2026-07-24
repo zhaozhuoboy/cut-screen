@@ -23,6 +23,20 @@ struct CapturedDisplay {
         return displayBounds
     }
 
+    func ownerProcessIdentifier(at point: CGPoint) -> pid_t? {
+        let displayBounds = CGRect(origin: .zero, size: pointSize)
+        guard displayBounds.contains(point) else { return nil }
+        for window in windows {
+            let localWindow = window.frame
+                .offsetBy(dx: -screenFrame.minX, dy: -screenFrame.minY)
+                .intersection(displayBounds)
+            if !localWindow.isNull, localWindow.contains(point) {
+                return window.ownerProcessIdentifier
+            }
+        }
+        return nil
+    }
+
     func pixelAlignedLocalRect(_ localRect: CGRect) -> CGRect {
         let clipped = localRect.standardized.intersection(CGRect(origin: .zero, size: pointSize))
         guard clipped.width > 0, clipped.height > 0, scale > 0 else { return .zero }
@@ -111,8 +125,23 @@ struct CapturedPixelColor: Equatable {
 struct DetectedWindow: Equatable {
     let windowID: CGWindowID
     let ownerName: String
+    let ownerProcessIdentifier: pid_t?
     let frame: CGRect
     let layer: Int
+
+    init(
+        windowID: CGWindowID,
+        ownerName: String,
+        ownerProcessIdentifier: pid_t? = nil,
+        frame: CGRect,
+        layer: Int
+    ) {
+        self.windowID = windowID
+        self.ownerName = ownerName
+        self.ownerProcessIdentifier = ownerProcessIdentifier
+        self.frame = frame
+        self.layer = layer
+    }
 }
 
 struct Selection: Equatable {

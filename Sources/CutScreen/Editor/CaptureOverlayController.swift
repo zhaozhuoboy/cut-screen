@@ -5,6 +5,7 @@ import CoreImage
 final class CaptureOverlayController: NSWindowController {
     let display: CapturedDisplay
     let overlayView: CaptureOverlayView
+    private var scrollingMaskWindows: [NSPanel] = []
 
     init(
         display: CapturedDisplay,
@@ -44,7 +45,13 @@ final class CaptureOverlayController: NSWindowController {
 
     required init?(coder: NSCoder) { nil }
 
+    override func close() {
+        closeScrollingMaskWindows()
+        super.close()
+    }
+
     func beginEditing(document: CaptureDocument, selectionRect: CGRect) {
+        closeScrollingMaskWindows()
         window?.ignoresMouseEvents = false
         window?.isOpaque = true
         window?.backgroundColor = .black
@@ -53,11 +60,91 @@ final class CaptureOverlayController: NSWindowController {
     }
 
     func beginScrollingMask(selectionRect: CGRect) {
-        window?.isOpaque = false
-        window?.backgroundColor = .clear
-        window?.ignoresMouseEvents = true
         overlayView.beginScrollingMask(selectionRect: selectionRect)
-        window?.orderFrontRegardless()
+        // Hide the full-screen editing overlay. A single ignoresMouseEvents
+        // window still owns the selection hole and can swallow wheel/trackpad
+        // events on some macOS versions; leave that region completely uncovered.
+        window?.orderOut(nil)
+        closeScrollingMaskWindows()
+
+        let displayBounds = CGRect(origin: .zero, size: display.pointSize)
+        let screenImage = NSImage(cgImage: display.image, size: display.pointSize)
+        scrollingMaskWindows = ScrollOverlayGeometry
+            .maskRects(in: displayBounds, outside: selectionRect)
+            .map { localFrame in
+                let panel = ScrollingPassthroughPanel(
+                    contentRect: localFrame.offsetBy(
+                        dx: display.screenFrame.minX,
+                        dy: display.screenFrame.minY
+                    ),
+                    styleMask: [.borderless, .nonactivatingPanel],
+                    backing: .buffered,
+                    defer: false
+                )
+                panel.level = .screenSaver
+                panel.isOpaque = true
+                panel.backgroundColor = .black
+                panel.hasShadow = false
+                panel.hidesOnDeactivate = false
+                panel.ignoresMouseEvents = true
+                panel.becomesKeyOnlyIfNeeded = true
+                panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+                panel.contentView = ScrollingMaskView(
+                    screenImage: screenImage,
+                    screenSize: display.pointSize,
+                    localFrame: localFrame
+                )
+                return panel
+            }
+
+        for panel in scrollingMaskWindows {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    private func closeScrollingMaskWindows() {
+        for panel in scrollingMaskWindows {
+            panel.orderOut(nil)
+            panel.close()
+        }
+        scrollingMaskWindows.removeAll()
+    }
+}
+
+private final class ScrollingPassthroughPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+private final class ScrollingMaskView: NSView {
+    private let screenImage: NSImage
+    private let screenSize: CGSize
+    private let localFrame: CGRect
+
+    init(screenImage: NSImage, screenSize: CGSize, localFrame: CGRect) {
+        self.screenImage = screenImage
+        self.screenSize = screenSize
+        self.localFrame = localFrame
+        super.init(frame: CGRect(origin: .zero, size: localFrame.size))
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        screenImage.draw(
+            in: CGRect(
+                x: -localFrame.minX,
+                y: -localFrame.minY,
+                width: screenSize.width,
+                height: screenSize.height
+            ),
+            from: .zero,
+            operation: .copy,
+            fraction: 1
+        )
+        NSColor.black.withAlphaComponent(0.52).setFill()
+        bounds.fill()
     }
 }
 
@@ -350,9 +437,9 @@ final class CaptureOverlayView: NSView, NSTextFieldDelegate {
               let context = NSGraphicsContext.current?.cgContext else { return }
 
         // Keep the original frozen screen outside the selection, exactly like
-        // regular capture mode, then punch a transparent hole through which the
-        // live source application can scroll. The window ignores mouse events,
-        // so trackpad and wheel input reaches the application underneath.
+        // regular capture mode. During live scrolling the full-screen window is
+        // ordered out and replaced by exterior mask panels so the selection
+        // remains uncovered for wheel and trackpad input.
         context.clear(bounds)
         fullImage.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
         NSColor.black.withAlphaComponent(0.52).setFill()

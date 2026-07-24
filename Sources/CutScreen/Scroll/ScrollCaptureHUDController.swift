@@ -5,7 +5,7 @@ final class ScrollCaptureHUDController {
     private let onSave: () -> Void
     private let onCancel: () -> Void
     private let onFinish: () -> Void
-    private let borderWindow: NSPanel
+    private let borderWindows: [NSPanel]
     private let controlWindow: NSPanel
     private let previewWindow: NSPanel
     private let previewScrollView = NSScrollView()
@@ -21,21 +21,25 @@ final class ScrollCaptureHUDController {
         self.onSave = onSave
         self.onCancel = onCancel
         self.onFinish = onFinish
-        borderWindow = NSPanel(
-            contentRect: selection.globalRect,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        borderWindow.level = .screenSaver
-        borderWindow.isOpaque = false
-        borderWindow.backgroundColor = .clear
-        borderWindow.hidesOnDeactivate = false
-        borderWindow.ignoresMouseEvents = true
-        borderWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        borderWindow.contentView?.wantsLayer = true
-        borderWindow.contentView?.layer?.borderWidth = 2
-        borderWindow.contentView?.layer?.borderColor = NSColor.systemGreen.cgColor
+        borderWindows = ScrollOverlayGeometry
+            .borderRects(around: selection.globalRect, in: selection.screenFrame)
+            .map { frame in
+                let panel = NSPanel(
+                    contentRect: frame,
+                    styleMask: [.borderless, .nonactivatingPanel],
+                    backing: .buffered,
+                    defer: false
+                )
+                panel.level = .screenSaver
+                panel.isOpaque = true
+                panel.backgroundColor = .systemGreen
+                panel.hasShadow = false
+                panel.hidesOnDeactivate = false
+                panel.ignoresMouseEvents = true
+                panel.becomesKeyOnlyIfNeeded = true
+                panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+                return panel
+            }
 
         controlWindow = NSPanel(
             contentRect: CGRect(x: 0, y: 0, width: 122, height: 44),
@@ -48,6 +52,7 @@ final class ScrollCaptureHUDController {
         controlWindow.backgroundColor = .clear
         controlWindow.hasShadow = true
         controlWindow.hidesOnDeactivate = false
+        controlWindow.becomesKeyOnlyIfNeeded = true
         controlWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let controlContent = GlassToolbarComponents.configure(controlWindow, cornerRadius: 12)
 
@@ -60,6 +65,7 @@ final class ScrollCaptureHUDController {
         )
         previewWindow.ignoresMouseEvents = true
         previewWindow.hidesOnDeactivate = false
+        previewWindow.becomesKeyOnlyIfNeeded = true
         let previewContent = GlassToolbarComponents.configure(previewWindow, cornerRadius: 13)
 
         let save = actionButton(icon: "save", tooltip: "保存长截图", action: #selector(saveCapture))
@@ -107,7 +113,9 @@ final class ScrollCaptureHUDController {
     }
 
     func show() {
-        borderWindow.orderFrontRegardless()
+        for borderWindow in borderWindows {
+            borderWindow.orderFrontRegardless()
+        }
         controlWindow.orderFrontRegardless()
         previewWindow.orderFrontRegardless()
     }
@@ -116,18 +124,27 @@ final class ScrollCaptureHUDController {
         if let preview { updatePreviewImage(preview) }
         switch result {
         case .noMatch:
-            borderWindow.contentView?.layer?.borderColor = NSColor.systemOrange.cgColor
+            setBorderColor(.systemOrange)
         case .firstFrame, .duplicate, .appended:
-            borderWindow.contentView?.layer?.borderColor = NSColor.systemGreen.cgColor
+            setBorderColor(.systemGreen)
         case .limitReached:
             requestFinishOnce()
         }
     }
 
     func close() {
-        borderWindow.orderOut(nil)
+        for borderWindow in borderWindows {
+            borderWindow.orderOut(nil)
+            borderWindow.close()
+        }
         controlWindow.orderOut(nil)
         previewWindow.orderOut(nil)
+    }
+
+    private func setBorderColor(_ color: NSColor) {
+        for borderWindow in borderWindows {
+            borderWindow.backgroundColor = color
+        }
     }
 
     private func buildPreview(in contentView: NSView) {

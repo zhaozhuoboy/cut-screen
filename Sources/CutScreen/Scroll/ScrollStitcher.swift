@@ -137,7 +137,7 @@ enum ScrollStitchError: LocalizedError {
 final class IncrementalScrollStitcher: ScrollStitching, @unchecked Sendable {
     static let maximumHeight = 50_000
     static let maximumPixels = 150_000_000
-    static let maximumConsecutiveNoMatches = 6
+    static let maximumConsecutiveNoMatches = 10
 
     private(set) var totalPixelHeight = 0
     private(set) var fixedBottomPixelHeight = 0
@@ -402,13 +402,13 @@ enum GrayFrameMatcher {
               previous.height >= 12 else { return nil }
 
         // Smooth wheel and trackpad scrolling often advances only one or two
-        // downsampled rows between 30 fps frames. Starting at a larger shift
+        // downsampled rows between sampled frames. Starting at a larger shift
         // over-appends overlapping content and visibly repeats the first frame.
         let minimumShift = 1
-        // At 30 fps a legitimate adjacent frame should retain substantial
-        // overlap. A larger jump is more likely a repeated page section matched
-        // against a stale frame, which produces duplicated viewport blocks.
-        let maximumShift = max(minimumShift, Int(Double(previous.height) * 0.40))
+        // Discrete mouse wheels and fast trackpad flicks can jump farther than
+        // smooth scrolling. Keep enough headroom while still rejecting
+        // repeated page sections matched against a stale frame.
+        let maximumShift = max(minimumShift, Int(Double(previous.height) * 0.50))
         var candidates: [(shift: Int, difference: Double)] = []
 
         for shift in minimumShift...maximumShift {
